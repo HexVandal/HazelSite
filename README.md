@@ -35,7 +35,7 @@ gloom. is designed to be a portfolio, blog, and tech playground. It features a c
 - **Components**: Modular, reusable components for UI, navigation, and content.
 - **Data Fetching**: Uses Tanstack Query for client/server data management.
 - **SEO**: Dynamic metadata for each page.
-- **Assets**: All images and static files are in `/src/assets`.
+- **Assets**: All images and static files are in `/apps/site/src/assets`.
 
 ---
 
@@ -141,7 +141,7 @@ For detailed instructions, visit the [Vercel documentation](https://vercel.com/d
 
 To write and publish blog posts on gloom., follow these steps:
 
-1. **Create a new Markdown file** in the `src/posts` directory.
+1. **Create a new Markdown file** in the `apps/site/src/posts` directory.
 2. **Add frontmatter** to the top of the file for metadata (title, date, slug, etc.).
 3. **Write your post content** using Markdown syntax.
 4. **Save and close the file**.
@@ -155,9 +155,9 @@ For more advanced usage, check the [Next.js Markdown documentation](https://next
 
 gloom. is designed to be easily customizable. To change the look and feel of your site, you can:
 
-- **Edit the global styles** in `src/styles/globals.css`.
+- **Edit the global styles** in `apps/site/src/styles/globals.css`.
 - **Customize the theme** in `tailwind.config.js`.
-- **Modify or add components** in the `src/components` directory.
+- **Modify or add components** in the `apps/site/src/components` directory.
 - **Update the layout** in `app/layout.tsx`.
 
 For detailed customization options, refer to the documentation of [TailwindCSS](https://tailwindcss.com/docs) and [shadcn/ui](https://ui.shadcn.com/docs).
@@ -209,3 +209,17 @@ gloom. is built with love and passion for web development. Special thanks to the
 ---
 
 Enjoy your visit to gloom., and feel free to reach out if you have any questions or feedback!
+
+## Contributor
+
+- **HexVandal** — contributor to the HazelSite project.
+
+## Monorepo: website + HQ dashboard + API
+
+- `apps/site/` — public Next.js website and blog.
+- `apps/hq/` — HQ administration dashboard.
+- `services/api/` — Go HTTP/gRPC API, OpenAPI and storage services.
+- `THIRD_PARTY_NOTICES.md` — upstream source attribution and license details.
+- `SHIPPING_SETUP.md` — production environment and deployment checklist.
+
+The imported projects retain their upstream licenses. For deployment roots, environment variables, database separation, storage, and first-admin setup, see `SHIPPING_SETUP.md`. Keep production secrets in the hosting providers' environment settings; do not commit `.env`.

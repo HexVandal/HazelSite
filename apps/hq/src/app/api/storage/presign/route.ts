@@ -1,0 +1,42 @@
+import { type NextRequest, NextResponse } from "next/server";
+import { requireAuth } from "@/lib/auth/server-auth";
+import {
+  createMetadata,
+  getStorageClient,
+  promisifyUnary,
+} from "@/lib/grpc/client";
+import { formatGrpcError } from "@/lib/grpc/errors";
+
+export async function POST(req: NextRequest) {
+  try {
+    const auth = requireAuth(req);
+    if (auth.error) return auth.error;
+
+    const body = await req.json();
+
+    if (!body.id) {
+      return NextResponse.json(
+        { error: "File ID is required" },
+        { status: 400 },
+      );
+    }
+
+    const client = getStorageClient();
+    const metadata = createMetadata({ token: auth.token });
+
+    const data = await promisifyUnary(
+      client,
+      "GeneratePresignedUrl",
+      {
+        id: body.id,
+        expiry_seconds: body.expiry_seconds || 3600,
+      },
+      metadata,
+    );
+
+    return NextResponse.json(data);
+  } catch (err) {
+    const { message, status } = formatGrpcError(err);
+    return NextResponse.json({ error: message }, { status });
+  }
+}

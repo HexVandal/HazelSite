@@ -1,0 +1,280 @@
+package router
+
+import (
+	"net/http"
+	"time"
+
+	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/compress"
+	"github.com/gofiber/fiber/v2/middleware/cors"
+	"github.com/gofiber/fiber/v2/middleware/limiter"
+	"github.com/gofiber/fiber/v2/middleware/logger"
+	"github.com/gofiber/fiber/v2/middleware/recover"
+	"github.com/irvanmalik48/realm-api/internal/auth"
+	"github.com/irvanmalik48/realm-api/internal/config"
+	"github.com/irvanmalik48/realm-api/internal/database"
+	"github.com/irvanmalik48/realm-api/internal/handler"
+	"github.com/irvanmalik48/realm-api/internal/middleware"
+	"github.com/irvanmalik48/realm-api/internal/openapi"
+	"github.com/irvanmalik48/realm-api/internal/queue"
+	"github.com/irvanmalik48/realm-api/internal/repository"
+	"github.com/irvanmalik48/realm-api/internal/service"
+	"github.com/irvanmalik48/realm-api/internal/storage"
+)
+
+type ServerDeps struct {
+	TokenCache    *auth.TokenCache
+	TokenLimiter  *auth.TokenRateLimiter
+	StorageEngine storage.Engine
+	Queue         queue.Queue
+}
+
+func New(cfg *config.Config, db *database.DB, deps ...*ServerDeps) *fiber.App {
+	bodyLimit := cfg.MaxUploadSizeMB * 1024 * 1024
+	if bodyLimit <= 0 {
+		bodyLimit = 10 * 1024 * 1024
+	}
+
+	app := fiber.New(fiber.Config{
+		AppName:               "Realm API",
+		DisableStartupMessage: cfg.Environment == "production",
+		BodyLimit:             bodyLimit,
+		ErrorHandler: func(c *fiber.Ctx, err error) error {
+			code := fiber.StatusInternalServerError
+			var e *fiber.Error
+			if errorsAs(err, &e) {
+				code = e.Code
+			}
+			return handler.ErrorResponse(c, err.Error(), code)
+		},
+	})
+
+	// Middlewares
+	app.Use(middleware.OpenTelemetryTracing())
+	app.Use(recover.New())
+	app.Use(logger.New(logger.Config{
+		Format: "[${time}] ${status} - ${latency} ${method} ${path}\n",
+	}))
+	app.Use(compress.New(compress.Config{
+		Level: compress.LevelDefault,
+	}))
+
+	allowedOrigins := cfg.AllowedOrigins
+	if allowedOrigins == "" {
+		allowedOrigins = "*"
+	}
+	corsConfig := cors.Config{
+		AllowOrigins: allowedOrigins,
+		AllowMethods: "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+		AllowHeaders: "Origin, Content-Type, Accept, Authorization, X-Gloom-Request, X-Realm-Request, X-Requested-With, X-API-Key, X-API-Token, X-Filename, Content-Disposition",
+	}
+	if allowedOrigins != "*" {
+		corsConfig.AllowCredentials = true
+	}
+	app.Use(cors.New(corsConfig))
+
+	// Repositories & Services
+	var contactRepo repository.ContactRepository
+	var storageRepo repository.StorageRepository
+	var tokenRepo repository.TokenRepository
+	var userRepo repository.UserRepository
+	var adminRepo repository.AdminRepository
+
+	if db != nil {
+		contactRepo = repository.NewContactRepository(db)
+		storageRepo = repository.NewStorageRepository(db)
+		tokenRepo = repository.NewTokenRepository(db)
+		userRepo = repository.NewUserRepository(db)
+		adminRepo = repository.NewAdminRepository(db)
+	}
+
+	var storageEngine storage.Engine
+	var tokenCache *auth.TokenCache
+	var tokenLimiter *auth.TokenRateLimiter
+
+	if len(deps) > 0 && deps[0] != nil {
+		storageEngine = deps[0].StorageEngine
+		tokenCache = deps[0].TokenCache
+		tokenLimiter = deps[0].TokenLimiter
+	}
+
+	if storageEngine == nil {
+		var err error
+		storageEngine, err = storage.NewZstdEngine(cfg.StorageDir)
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	if tokenCache == nil {
+		tokenCache = auth.NewTokenCache(5 * time.Minute)
+		app.Hooks().OnShutdown(func() error {
+			tokenCache.Close()
+			return nil
+		})
+	}
+
+	if tokenLimiter == nil {
+		tokenLimiter = auth.NewTokenRateLimiter()
+		app.Hooks().OnShutdown(func() error {
+			tokenLimiter.Close()
+			return nil
+		})
+	}
+
+	pasetoSvc, err := auth.NewPasetoService(cfg.PASETOSymmetricKey)
+	if err != nil {
+		panic(err)
+	}
+
+	lastFMSvc := service.NewLastFMService(cfg.LastFMAPIKey, cfg.LastFMAPISecret)
+	contactSvc := service.NewContactService(cfg, contactRepo)
+	storageSvc := service.NewStorageService(cfg, storageRepo, storageEngine)
+	if len(deps) > 0 && deps[0] != nil && deps[0].Queue != nil {
+		storageSvc.SetQueue(deps[0].Queue)
+	}
+	tokenSvc := service.NewTokenService(tokenRepo, tokenCache, tokenLimiter)
+	oauthSvc := service.NewOAuthService(cfg)
+	authSvc := service.NewAuthService(userRepo, pasetoSvc)
+
+	rootHdlr := handler.NewRootHandler()
+	healthHdlr := handler.NewHealthHandler(db)
+	lastFMHdlr := handler.NewLastFMHandler(cfg, lastFMSvc)
+	contactHdlr := handler.NewContactHandler(cfg, contactSvc)
+	storageHdlr := handler.NewStorageHandler(cfg, storageSvc)
+	authHdlr := handler.NewAuthHandler(cfg, authSvc, oauthSvc, pasetoSvc)
+	postRepo := repository.NewPostRepository(db)
+	postSvc := service.NewPostService(postRepo)
+	postHdlr := handler.NewPostHandler(cfg, postSvc)
+
+	analyticsRepo := repository.NewAnalyticsRepository(db)
+	analyticsSvc := service.NewAnalyticsService(analyticsRepo)
+	analyticsHdlr := handler.NewAnalyticsHandler(cfg, analyticsSvc)
+	userHdlr := handler.NewUserHandler(cfg, userRepo)
+
+	// Root, Health, and Telemetry routes
+	app.Get("/", rootHdlr.Handle)
+	app.Get("/health", healthHdlr.Handle)
+	app.Get("/telemetry", healthHdlr.Telemetry)
+	app.Get("/health/stream", healthHdlr.Stream)
+	app.Get("/telemetry/stream", healthHdlr.Stream)
+
+	// OpenAPI Specification and Interactive Docs
+	app.Get("/openapi.yaml", openapi.ServeYAML)
+	app.Get("/openapi.json", openapi.ServeJSON)
+	app.Get("/docs", openapi.ServeDocs)
+
+	// v1 routes (/v1/health, /v1/telemetry, /v1/lastfm/track, /v1/lastfm/user, /v1/contact, /v1/storage, /v1/auth, /v1/posts)
+	v1 := app.Group("/v1")
+	v1.Get("/health", healthHdlr.Handle)
+	v1.Get("/telemetry", healthHdlr.Telemetry)
+	v1.Get("/health/stream", healthHdlr.Stream)
+	v1.Get("/telemetry/stream", healthHdlr.Stream)
+	v1.Get("/openapi.yaml", openapi.ServeYAML)
+	v1.Get("/openapi.json", openapi.ServeJSON)
+	v1.Get("/docs", openapi.ServeDocs)
+
+	// Rate limiters for sensitive endpoints
+	checkLimiter := limiter.New(limiter.Config{
+		Max:        30,
+		Expiration: 1 * time.Minute,
+		LimitReached: func(c *fiber.Ctx) error {
+			return handler.ErrorResponse(c, "Too many requests. Please try again later.", http.StatusTooManyRequests)
+		},
+	})
+	authLimiter := limiter.New(limiter.Config{
+		Max:        15,
+		Expiration: 1 * time.Minute,
+		LimitReached: func(c *fiber.Ctx) error {
+			return handler.ErrorResponse(c, "Too many authentication attempts. Please try again later.", http.StatusTooManyRequests)
+		},
+	})
+
+	// User Auth endpoints (Traditional & OIDC/OAuth2 with PASETO tokens)
+	authGroup := v1.Group("/auth")
+	authGroup.Get("/check", checkLimiter, authHdlr.CheckAvailability)
+	authGroup.Post("/register", authLimiter, authHdlr.Register)
+	authGroup.Post("/login", authLimiter, authHdlr.Login)
+	authGroup.Post("/2fa/verify", authLimiter, authHdlr.Verify2FA)
+	authGroup.Post("/2fa/setup", middleware.RequireUserAuth(pasetoSvc), authHdlr.Setup2FA)
+	authGroup.Post("/2fa/enable", middleware.RequireUserAuth(pasetoSvc), authHdlr.Enable2FA)
+	authGroup.Post("/2fa/disable", middleware.RequireUserAuth(pasetoSvc), authHdlr.Disable2FA)
+	authGroup.Get("/me", middleware.RequireUserAuth(pasetoSvc), authHdlr.GetMe)
+	authGroup.Patch("/profile", middleware.RequireUserAuth(pasetoSvc), authHdlr.UpdateProfile)
+	authGroup.Post("/password", middleware.RequireUserAuth(pasetoSvc), authHdlr.SetPassword)
+	authGroup.Delete("/oauth/:provider", middleware.RequireUserAuth(pasetoSvc), authHdlr.UnlinkOAuth)
+	authGroup.Get("/google", authHdlr.GoogleLogin)
+	authGroup.Get("/google/callback", authHdlr.GoogleCallback)
+	authGroup.Get("/github", authHdlr.GitHubLogin)
+	authGroup.Get("/github/callback", authHdlr.GitHubCallback)
+
+	// Post Article endpoints (served to realm-reference, managed by realm-hq)
+	postsGroup := v1.Group("/posts")
+	postsGroup.Get("/", postHdlr.ListPosts)
+	postsGroup.Get("/:slug", postHdlr.GetPost)
+	postsGroup.Post("/", middleware.RequireTokenOrUserAuth(tokenSvc, pasetoSvc, adminRepo, tokenLimiter, "posts:write"), postHdlr.CreatePost)
+	postsGroup.Patch("/:slug", middleware.RequireTokenOrUserAuth(tokenSvc, pasetoSvc, adminRepo, tokenLimiter, "posts:write"), postHdlr.UpdatePost)
+	postsGroup.Put("/:slug", middleware.RequireTokenOrUserAuth(tokenSvc, pasetoSvc, adminRepo, tokenLimiter, "posts:write"), postHdlr.UpdatePost)
+	postsGroup.Delete("/:slug", middleware.RequireTokenOrUserAuth(tokenSvc, pasetoSvc, adminRepo, tokenLimiter, "posts:delete"), postHdlr.DeletePost)
+
+	// Analytics / Page Views endpoints
+	analyticsGroup := v1.Group("/analytics")
+	analyticsGroup.Post("/events", analyticsHdlr.TrackEvent)
+	analyticsGroup.Get("/stats", analyticsHdlr.GetStats)
+
+	// LastFM endpoints with optional token auth and dynamic rate limiting
+	lastfm := v1.Group("/lastfm", middleware.OptionalToken(tokenSvc, tokenLimiter))
+	lastfm.Get("/track", lastFMHdlr.GetRecentTracks)
+	lastfm.Get("/user", lastFMHdlr.GetUserInfo)
+
+	// Contact endpoint with CSRF protection and rate limiting (5 requests per 10 minutes)
+	contactLimiter := limiter.New(limiter.Config{
+		Max:        5,
+		Expiration: 10 * time.Minute,
+		LimitReached: func(c *fiber.Ctx) error {
+			return handler.ErrorResponse(c, "Too many requests. Please try again later.", http.StatusTooManyRequests)
+		},
+	})
+	v1.Post("/contact", middleware.CSRFProtection(cfg), contactLimiter, contactHdlr.Handle)
+
+	// Storage endpoints (Zstd-compressed, Blurhash, on-the-fly WebP)
+	storageGroup := v1.Group("/storage")
+	storageGroup.Post("/image-metadata", middleware.OptionalToken(tokenSvc, tokenLimiter), storageHdlr.GetImageMetadata)
+	storageGroup.Get("/image-metadata", middleware.OptionalToken(tokenSvc, tokenLimiter), storageHdlr.GetImageMetadata)
+	storageGroup.Post("/upload", middleware.RequireTokenOrUserAuth(tokenSvc, pasetoSvc, adminRepo, tokenLimiter, "storage:write"), storageHdlr.Upload)
+	storageGroup.Get("/:id", middleware.OptionalToken(tokenSvc, tokenLimiter), storageHdlr.GetFile)
+	storageGroup.Get("/:id/info", middleware.OptionalToken(tokenSvc, tokenLimiter), storageHdlr.GetFileInfo)
+	storageGroup.Delete("/:id", middleware.RequireTokenOrUserAuth(tokenSvc, pasetoSvc, adminRepo, tokenLimiter, "storage:write"), storageHdlr.DeleteFile)
+
+	// User Management endpoints
+	usersGroup := v1.Group("/users")
+	usersGroup.Get("/", middleware.RequireTokenOrUserAuth(tokenSvc, pasetoSvc, adminRepo, tokenLimiter, "users:read"), userHdlr.ListUsers)
+	usersGroup.Patch("/:id", middleware.RequireTokenOrUserAuth(tokenSvc, pasetoSvc, adminRepo, tokenLimiter, "users:manage"), userHdlr.UpdateUser)
+	usersGroup.Put("/:id", middleware.RequireTokenOrUserAuth(tokenSvc, pasetoSvc, adminRepo, tokenLimiter, "users:manage"), userHdlr.UpdateUser)
+	usersGroup.Delete("/:id", middleware.RequireTokenOrUserAuth(tokenSvc, pasetoSvc, adminRepo, tokenLimiter, "users:manage"), userHdlr.DeleteUser)
+
+	// Media aliases
+	mediaGroup := v1.Group("/media")
+	mediaGroup.Post("/image-metadata", middleware.OptionalToken(tokenSvc, tokenLimiter), storageHdlr.GetImageMetadata)
+	mediaGroup.Get("/image-metadata", middleware.OptionalToken(tokenSvc, tokenLimiter), storageHdlr.GetImageMetadata)
+
+	// 404 Not Found fallback handler
+	app.Use(func(c *fiber.Ctx) error {
+		return handler.ErrorResponse(c, "Endpoint not found", http.StatusNotFound)
+	})
+
+	return app
+}
+
+func errorsAs(err error, target interface{}) bool {
+	if err == nil {
+		return false
+	}
+	if e, ok := err.(*fiber.Error); ok {
+		if t, ok := target.(**fiber.Error); ok {
+			*t = e
+			return true
+		}
+	}
+	return false
+}

@@ -1,0 +1,2243 @@
+openapi: 3.2.0
+$self: https://api.irvanma.eu.org/openapi.yaml
+info:
+  title: Gloom API
+  description: High-performance backend API service for Gloom built with Go, Fiber v2, and PostgreSQL.
+  version: 1.0.0
+  contact:
+    name: Irvan Malik Azantha
+    url: https://irvanma.eu.org
+    email: irvanma@gnuweeb.org
+  license:
+    name: RCCL-1.0
+    url: https://github.com/irvanmalik48/realm-api/blob/main/LICENSE
+
+servers:
+  - url: https://api.irvanma.eu.org
+    description: Production Server
+  - url: http://localhost:8080
+    description: Local Development Server
+
+tags:
+  - name: Health
+    summary: Health check and status
+    description: Core service health and uptime endpoints.
+  - name: Authentication
+    summary: User Authentication & Sessions
+    description: User registration, credentials login, profile management, and Google/GitHub OIDC flows with PASETO bearer tokens.
+  - name: LastFM
+    summary: LastFM Scrobble and User Data
+    description: Proxied, cached endpoints for LastFM track scrobbles and user statistics.
+  - name: Contact
+    summary: Contact Form Submissions
+    description: Contact message ingestion with CSRF protection, rate limiting, and instant notifications.
+  - name: Storage
+    summary: Zstandard Compressed File Storage
+    description: High-performance file storage with Zstd compression, Blurhash analysis, and endpoint-level WebP conversion.
+  - name: Posts
+    summary: Articles & Blog Posts
+    description: Article publishing and content management serving the public reader site and admin console.
+  - name: Analytics
+    summary: Web Analytics & Visitor Telemetry
+    description: Ingestion and aggregate analytics query endpoints for visitor page views, referrers, and user agents.
+
+paths:
+  /:
+    get:
+      summary: Root greeting endpoint
+      operationId: getRoot
+      tags:
+        - Health
+      responses:
+        '200':
+          description: Root message
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RootResponse'
+
+  /health:
+    get:
+      summary: Service health check and uptime status
+      operationId: getHealth
+      tags:
+        - Health
+      responses:
+        '200':
+          description: Service health details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /v1/health:
+    get:
+      summary: Versioned health check
+      operationId: getV1Health
+      tags:
+        - Health
+      responses:
+        '200':
+          description: Service health details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /telemetry:
+    get:
+      summary: Realtime system telemetry and performance metrics
+      description: Detailed system observability metrics including realtime CPU utilization, per-core utilization, clock frequencies, load averages, memory allocation, and database connection pool statistics.
+      operationId: getTelemetry
+      tags:
+        - Health
+      responses:
+        '200':
+          description: Detailed telemetry status and hardware metrics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DetailedTelemetryResponse'
+
+  /v1/telemetry:
+    get:
+      summary: Versioned realtime system telemetry
+      description: Detailed system observability metrics including realtime CPU utilization, per-core utilization, clock frequencies, load averages, memory allocation, and database connection pool statistics.
+      operationId: getV1Telemetry
+      tags:
+        - Health
+      responses:
+        '200':
+          description: Detailed telemetry status and hardware metrics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DetailedTelemetryResponse'
+
+  /v1/auth/check:
+    get:
+      summary: Check username and email availability
+      operationId: checkAvailability
+      tags:
+        - Authentication
+      parameters:
+        - name: username
+          in: query
+          required: false
+          schema:
+            type: string
+            example: janedoe
+        - name: email
+          in: query
+          required: false
+          schema:
+            type: string
+            format: email
+            example: jane@example.com
+      responses:
+        '200':
+          description: Availability check result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckAvailabilityResponse'
+
+  /v1/auth/register:
+    post:
+      summary: Register a new user account
+      operationId: registerUser
+      tags:
+        - Authentication
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterInput'
+      responses:
+        '201':
+          description: User registered successfully and PASETO session token issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '400':
+          description: Invalid input validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: User with this email or username already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/auth/login:
+    post:
+      summary: Authenticate with username or email and password
+      operationId: loginUser
+      tags:
+        - Authentication
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginInput'
+      responses:
+        '200':
+          description: Successfully authenticated and PASETO session token issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '401':
+          description: Invalid username/email or password
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/auth/2fa/verify:
+    post:
+      summary: Verify two-factor authentication challenge
+      operationId: verify2FA
+      tags:
+        - Authentication
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Verify2FARequest'
+      responses:
+        '200':
+          description: Successfully verified 2FA and full PASETO session token issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '401':
+          description: Invalid 2FA verification code, recovery code, or expired temporary token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/auth/2fa/setup:
+    post:
+      summary: Initialize two-factor authentication setup
+      operationId: setup2FA
+      tags:
+        - Authentication
+      security:
+        - PasetoAuth: []
+      responses:
+        '200':
+          description: TOTP secret and QR code generated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Setup2FAResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/auth/2fa/enable:
+    post:
+      summary: Confirm and enable two-factor authentication
+      operationId: enable2FA
+      tags:
+        - Authentication
+      security:
+        - PasetoAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Enable2FARequest'
+      responses:
+        '200':
+          description: 2FA activated and 8 backup recovery codes issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Enable2FAResponse'
+        '400':
+          description: Invalid TOTP verification code
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/auth/2fa/disable:
+    post:
+      summary: Disable two-factor authentication
+      operationId: disable2FA
+      tags:
+        - Authentication
+      security:
+        - PasetoAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Disable2FARequest'
+      responses:
+        '200':
+          description: 2FA successfully disabled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Disable2FAResponse'
+        '400':
+          description: Invalid confirmation code or password
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/auth/me:
+    get:
+      summary: Get current authenticated user profile
+      operationId: getCurrentUserProfile
+      tags:
+        - Authentication
+      security:
+        - PasetoAuth: []
+      responses:
+        '200':
+          description: Current user profile data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProfileResponse'
+        '401':
+          description: Missing or expired PASETO authentication token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/auth/profile:
+    patch:
+      summary: Update user profile
+      operationId: updateUserProfile
+      tags:
+        - Authentication
+      security:
+        - PasetoAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateProfileInput'
+      responses:
+        '200':
+          description: Profile updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProfileResponse'
+        '400':
+          description: Invalid input validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Missing or expired PASETO authentication token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/auth/password:
+    post:
+      summary: Set or change account password
+      operationId: setAccountPassword
+      tags:
+        - Authentication
+      security:
+        - PasetoAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetPasswordInput'
+      responses:
+        '200':
+          description: Password updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericSuccessResponse'
+        '400':
+          description: Invalid password or incorrect current password
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/auth/oauth/{provider}:
+    delete:
+      summary: Disconnect a connected OAuth social account
+      operationId: unlinkOAuthAccount
+      tags:
+        - Authentication
+      security:
+        - PasetoAuth: []
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [google, github]
+      responses:
+        '200':
+          description: Account disconnected successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericSuccessResponse'
+        '400':
+          description: Cannot disconnect the only login method
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/auth/google:
+    get:
+      summary: Initiate Google OIDC sign-in
+      operationId: googleLogin
+      tags:
+        - Authentication
+      responses:
+        '307':
+          description: Temporary redirect to Google OAuth consent screen
+
+  /v1/auth/google/callback:
+    get:
+      summary: Google OIDC OAuth callback handler
+      operationId: googleCallback
+      tags:
+        - Authentication
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: state
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '307':
+          description: Redirects to frontend application with PASETO session token
+
+  /v1/auth/github:
+    get:
+      summary: Initiate GitHub OAuth2 sign-in
+      operationId: githubLogin
+      tags:
+        - Authentication
+      responses:
+        '307':
+          description: Temporary redirect to GitHub OAuth consent screen
+
+  /v1/auth/github/callback:
+    get:
+      summary: GitHub OAuth2 callback handler
+      operationId: githubCallback
+      tags:
+        - Authentication
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: state
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '307':
+          description: Redirects to frontend application with PASETO session token
+
+  /v1/lastfm/track:
+    get:
+      summary: Get recent LastFM tracks
+      operationId: getLastFMRecentTracks
+      tags:
+        - LastFM
+      parameters:
+        - name: username
+          in: query
+          required: true
+          description: LastFM username
+          schema:
+            type: string
+            example: irvanmalik48
+        - name: limit
+          in: query
+          required: false
+          description: Number of tracks to retrieve (1-200)
+          schema:
+            type: integer
+            default: 1
+            minimum: 1
+            maximum: 200
+            example: 8
+      responses:
+        '200':
+          description: List of recent tracks
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: public, s-maxage=900, stale-while-revalidate=1800
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LastFMTrackResponse'
+        '400':
+          description: Missing or invalid parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Server configuration error or missing API key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '502':
+          description: Upstream LastFM gateway error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/lastfm/user:
+    get:
+      summary: Get LastFM user profile
+      operationId: getLastFMUserInfo
+      tags:
+        - LastFM
+      parameters:
+        - name: username
+          in: query
+          required: true
+          description: LastFM username
+          schema:
+            type: string
+            example: irvanmalik48
+      responses:
+        '200':
+          description: User profile and statistics
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: public, s-maxage=900, stale-while-revalidate=1800
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LastFMUserResponse'
+        '400':
+          description: Missing or invalid parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '502':
+          description: Upstream LastFM gateway error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/contact:
+    post:
+      summary: Submit contact form message
+      operationId: submitContactMessage
+      tags:
+        - Contact
+      parameters:
+        - name: X-Gloom-Request
+          in: header
+          required: false
+          description: Security header for CSRF protection
+          schema:
+            type: string
+            example: '1'
+        - name: X-Requested-With
+          in: header
+          required: false
+          description: Alternative CSRF protection header
+          schema:
+            type: string
+            example: XMLHttpRequest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ContactRequest'
+      responses:
+        '200':
+          description: Message accepted and persisted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContactResponse'
+        '400':
+          description: Validation error or missing security headers
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: CSRF origin validation forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          description: Rate limit exceeded (5 requests per 10 minutes)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Database persistence error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/storage/upload:
+    post:
+      summary: Upload and compress file
+      operationId: uploadFile
+      tags:
+        - Storage
+      security:
+        - ApiTokenAuth: []
+        - ApiTokenHeader: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - file
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: The file to upload and compress with Zstd
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+              description: Raw binary payload of the file to upload and compress with Zstd
+      responses:
+        '201':
+          description: File uploaded, compressed, and registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FileUploadResponse'
+        '400':
+          description: No file uploaded or corrupted payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized - missing or invalid storage API key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '413':
+          description: File size exceeds MAX_UPLOAD_SIZE_MB
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Storage or compression processing error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/storage/{id}:
+    get:
+      summary: Fetch stored file or convert to WebP
+      operationId: getFile
+      tags:
+        - Storage
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: File UUID identifier
+          schema:
+            type: string
+            format: uuid
+            example: 7fa84e72-d7b1-4bb2-b6be-4b95d0ef923b
+        - name: format
+          in: query
+          required: false
+          description: Request on-the-fly image conversion to WebP
+          schema:
+            type: string
+            enum: [webp]
+        - name: download
+          in: query
+          required: false
+          description: Force attachment download disposition
+          schema:
+            type: boolean
+            default: false
+        - name: If-None-Match
+          in: header
+          required: false
+          description: ETag value for cache validation
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Decompressed file stream
+          headers:
+            Content-Type:
+              schema:
+                type: string
+                example: image/webp
+            Content-Disposition:
+              schema:
+                type: string
+                example: inline; filename="wallpaper.webp"
+            ETag:
+              schema:
+                type: string
+                example: '"5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8"'
+            Cache-Control:
+              schema:
+                type: string
+                example: public, max-age=31536000, immutable
+            X-Blurhash:
+              schema:
+                type: string
+                example: LEHV6nWB2yk8pyo0adR*.7kCMdnj
+            X-Image-Width:
+              schema:
+                type: integer
+                example: 1920
+            X-Image-Height:
+              schema:
+                type: integer
+                example: 1080
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+            image/*:
+              schema:
+                type: string
+                format: binary
+        '304':
+          description: Resource Not Modified (ETag cache hit)
+        '400':
+          description: Invalid UUID format
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: File not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    delete:
+      summary: Delete stored file
+      operationId: deleteFile
+      tags:
+        - Storage
+      security:
+        - ApiTokenAuth: []
+        - ApiTokenHeader: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: File UUID identifier
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: File and metadata successfully deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: File deleted successfully
+                  status:
+                    type: string
+                    example: success
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: File not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/storage/{id}/info:
+    get:
+      summary: Get file metadata and Blurhash
+      operationId: getFileInfo
+      tags:
+        - Storage
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: File UUID identifier
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: File metadata details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FileInfoResponse'
+        '400':
+          description: Invalid UUID format
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: File record not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/posts:
+    get:
+      summary: List blog articles
+      operationId: listPosts
+      tags:
+        - Posts
+      parameters:
+        - name: tag
+          in: query
+          required: false
+          schema:
+            type: string
+            example: Linux
+        - name: search
+          in: query
+          required: false
+          schema:
+            type: string
+            example: Secure Boot
+        - name: published
+          in: query
+          required: false
+          description: Filter by publication status (true or false)
+          schema:
+            type: boolean
+            default: true
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 50
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: Paginated articles list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PostsListResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    post:
+      summary: Create new article
+      operationId: createPost
+      tags:
+        - Posts
+      security:
+        - PasetoAuth: []
+        - ApiTokenAuth: []
+        - ApiTokenHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePostRequest'
+      responses:
+        '201':
+          description: Article created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PostDTO'
+        '400':
+          description: Invalid payload or empty title
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/posts/{slug}:
+    get:
+      summary: Get full article by slug
+      operationId: getPostBySlug
+      tags:
+        - Posts
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          description: Article slug
+          schema:
+            type: string
+            example: all-black-and-heavywear
+        - name: include_drafts
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Full article details with markdown content
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PostDTO'
+        '404':
+          description: Post not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    patch:
+      summary: Update article
+      operationId: updatePost
+      tags:
+        - Posts
+      security:
+        - PasetoAuth: []
+        - ApiTokenAuth: []
+        - ApiTokenHeader: []
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          description: Article slug
+          schema:
+            type: string
+            example: all-black-and-heavywear
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdatePostRequest'
+      responses:
+        '200':
+          description: Article updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PostDTO'
+        '400':
+          description: Invalid payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Post not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    delete:
+      summary: Delete article
+      operationId: deletePost
+      tags:
+        - Posts
+      security:
+        - PasetoAuth: []
+        - ApiTokenAuth: []
+        - ApiTokenHeader: []
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          description: Article slug
+          schema:
+            type: string
+            example: all-black-and-heavywear
+      responses:
+        '200':
+          description: Article deleted successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericSuccessResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Post not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/analytics/events:
+    post:
+      summary: Track a pageview event
+      operationId: trackAnalyticsEvent
+      tags:
+        - Analytics
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TrackEventRequest'
+      responses:
+        '201':
+          description: Event recorded successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrackEventResponse'
+        '400':
+          description: Invalid request payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/analytics/stats:
+    get:
+      summary: Retrieve aggregated web analytics statistics
+      operationId: getAnalyticsStats
+      tags:
+        - Analytics
+      parameters:
+        - name: period
+          in: query
+          required: false
+          description: Time window period (24h, 7d, 30d, all). Defaults to 30d.
+          schema:
+            type: string
+            enum: [24h, 7d, 30d, all]
+            default: 30d
+      responses:
+        '200':
+          description: Analytics statistics and trend metrics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalyticsStatsResponse'
+
+components:
+  securitySchemes:
+    PasetoAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: paseto
+      description: PASETO v2.local symmetric encrypted token (e.g. v2.local...)
+    ApiTokenAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: realm_tok
+      description: Cryptographically secure API token generated via CLI (e.g. realm_tok_...)
+    ApiTokenHeader:
+      type: apiKey
+      in: header
+      name: X-API-Token
+      description: API token passed via X-API-Token or X-API-Key header
+
+  schemas:
+    RootResponse:
+      type: object
+      required:
+        - message
+        - status
+      properties:
+        message:
+          type: string
+          example: Nothing to see here
+        status:
+          type: string
+          example: success
+
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - service
+        - version
+        - uptime_seconds
+        - timestamp
+        - database
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded, unhealthy]
+          example: healthy
+        service:
+          type: string
+          example: gloom-api
+        version:
+          type: string
+          example: 1.0.0
+        uptime_seconds:
+          type: integer
+          example: 86400
+        timestamp:
+          type: string
+          format: date-time
+          example: '2026-08-20T13:18:31Z'
+        database:
+          type: string
+          example: connected
+
+    DBPoolStats:
+      type: object
+      required:
+        - acquired_conns
+        - idle_conns
+        - total_conns
+        - max_conns
+      properties:
+        acquired_conns:
+          type: integer
+          description: Current number of database connections actively leased by queries.
+          example: 3
+        idle_conns:
+          type: integer
+          description: Current number of idle connections waiting in the pool.
+          example: 7
+        total_conns:
+          type: integer
+          description: Total open connections in the pool.
+          example: 10
+        max_conns:
+          type: integer
+          description: Configured maximum connection limit for the pool.
+          example: 25
+
+    RuntimeStats:
+      type: object
+      required:
+        - goroutines
+        - alloc_bytes
+        - total_alloc_bytes
+        - sys_bytes
+        - gc_cycles
+      properties:
+        goroutines:
+          type: integer
+          description: Number of active Go goroutines.
+          example: 42
+        alloc_bytes:
+          type: integer
+          format: int64
+          description: Current heap allocation in bytes.
+          example: 18454912
+        total_alloc_bytes:
+          type: integer
+          format: int64
+          description: Cumulative bytes allocated throughout process lifetime.
+          example: 128459200
+        sys_bytes:
+          type: integer
+          format: int64
+          description: Total virtual memory obtained from operating system in bytes.
+          example: 45088768
+        gc_cycles:
+          type: integer
+          description: Completed garbage collection cycles.
+          example: 15
+
+    CPUStats:
+      type: object
+      required:
+        - usage_percent
+        - core_usage_percent
+        - avg_frequency_mhz
+        - core_frequency_mhz
+        - min_frequency_mhz
+        - max_frequency_mhz
+        - load_1m
+        - load_5m
+        - load_15m
+        - model_name
+        - core_count
+      properties:
+        usage_percent:
+          type: number
+          format: double
+          description: Realtime overall CPU utilization percentage.
+          example: 12.5
+        core_usage_percent:
+          type: array
+          items:
+            type: number
+            format: double
+          description: Per-core CPU utilization percentage.
+          example: [14.2, 10.8, 15.0, 10.0]
+        avg_frequency_mhz:
+          type: number
+          format: double
+          description: Average CPU clock speed across all online cores in MHz.
+          example: 3200.5
+        core_frequency_mhz:
+          type: array
+          items:
+            type: number
+            format: double
+          description: Per-core active CPU clock speed in MHz.
+          example: [3200.0, 3198.5, 3205.0, 3199.0]
+        min_frequency_mhz:
+          type: number
+          format: double
+          description: Minimum CPU clock frequency capability reported by sysfs in MHz.
+          example: 800.0
+        max_frequency_mhz:
+          type: number
+          format: double
+          description: Maximum CPU clock frequency capability reported by sysfs in MHz.
+          example: 4500.0
+        load_1m:
+          type: number
+          format: double
+          description: Operating system load average over 1 minute.
+          example: 0.85
+        load_5m:
+          type: number
+          format: double
+          description: Operating system load average over 5 minutes.
+          example: 0.62
+        load_15m:
+          type: number
+          format: double
+          description: Operating system load average over 15 minutes.
+          example: 0.45
+        model_name:
+          type: string
+          description: Processor model description detected from /proc/cpuinfo.
+          example: AMD Ryzen 9 7950X 16-Core Processor
+        core_count:
+          type: integer
+          description: Total count of online logical CPU cores.
+          example: 32
+
+    DetailedTelemetryResponse:
+      type: object
+      required:
+        - status
+        - service
+        - version
+        - uptime_seconds
+        - timestamp
+        - database
+        - db_pool
+        - runtime
+        - cpu
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded, unhealthy]
+          example: healthy
+        service:
+          type: string
+          example: gloom-api
+        version:
+          type: string
+          example: 1.0.0
+        uptime_seconds:
+          type: integer
+          example: 86400
+        timestamp:
+          type: string
+          format: date-time
+          example: '2026-08-20T13:18:31Z'
+        database:
+          type: string
+          example: connected
+        db_pool:
+          $ref: '#/components/schemas/DBPoolStats'
+        runtime:
+          $ref: '#/components/schemas/RuntimeStats'
+        cpu:
+          $ref: '#/components/schemas/CPUStats'
+
+    ErrorResponse:
+      type: object
+      required:
+        - error
+        - status
+      properties:
+        error:
+          type: string
+          example: Invalid parameters
+        status:
+          type: string
+          example: error
+
+    ContactRequest:
+      type: object
+      required:
+        - name
+        - email
+        - subject
+        - message
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 100
+          example: Jane Doe
+        email:
+          type: string
+          format: email
+          maxLength: 254
+          example: jane@example.com
+        subject:
+          type: string
+          minLength: 3
+          maxLength: 200
+          example: Project Collaboration
+        message:
+          type: string
+          minLength: 10
+          maxLength: 5000
+          example: Hello, I would like to discuss a project with you.
+        _gotcha:
+          type: string
+          description: Honeypot field (must remain empty for human submissions)
+          example: ""
+
+    ContactResponse:
+      type: object
+      required:
+        - message
+        - status
+      properties:
+        message:
+          type: string
+          example: Your message has been sent successfully.
+        status:
+          type: string
+          example: success
+
+    FileDTO:
+      type: object
+      required:
+        - id
+        - filename
+        - content_type
+        - original_size
+        - compressed_size
+        - savings_percent
+        - sha256
+        - url
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: 7fa84e72-d7b1-4bb2-b6be-4b95d0ef923b
+        filename:
+          type: string
+          example: wallpaper.png
+        content_type:
+          type: string
+          example: image/png
+        original_size:
+          type: integer
+          format: int64
+          example: 2450000
+        compressed_size:
+          type: integer
+          format: int64
+          example: 1120000
+        savings_percent:
+          type: number
+          format: float
+          example: 54.28
+        sha256:
+          type: string
+          example: 5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8
+        blurhash:
+          type: string
+          nullable: true
+          example: LEHV6nWB2yk8pyo0adR*.7kCMdnj
+        width:
+          type: integer
+          nullable: true
+          example: 1920
+        height:
+          type: integer
+          nullable: true
+          example: 1080
+        url:
+          type: string
+          example: /v1/storage/7fa84e72-d7b1-4bb2-b6be-4b95d0ef923b
+        webp_url:
+          type: string
+          nullable: true
+          example: /v1/storage/7fa84e72-d7b1-4bb2-b6be-4b95d0ef923b?format=webp
+        storage_backend:
+          type: string
+          example: s3
+        s3_bucket:
+          type: string
+          nullable: true
+          example: gloom-storage
+        s3_key:
+          type: string
+          nullable: true
+          example: 7fa84e72-d7b1-4bb2-b6be-4b95d0ef923b.zst
+        s3_etag:
+          type: string
+          nullable: true
+          example: '"6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b"'
+        s3_url:
+          type: string
+          nullable: true
+          example: https://s3.irvanma.eu.org/gloom-storage/7fa84e72-d7b1-4bb2-b6be-4b95d0ef923b.zst
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-08-20T12:00:00Z'
+
+    FileUploadResponse:
+      type: object
+      required:
+        - status
+        - message
+        - file
+      properties:
+        status:
+          type: string
+          example: success
+        message:
+          type: string
+          example: File uploaded and compressed successfully
+        file:
+          $ref: '#/components/schemas/FileDTO'
+
+    FileInfoResponse:
+      type: object
+      required:
+        - status
+        - file
+      properties:
+        status:
+          type: string
+          example: success
+        file:
+          $ref: '#/components/schemas/FileDTO'
+
+    LastFMTrackResponse:
+      type: object
+      properties:
+        recenttracks:
+          type: object
+          properties:
+            track:
+              type: array
+              items:
+                type: object
+                properties:
+                  name:
+                    type: string
+                  artist:
+                    type: object
+                    properties:
+                      '#text':
+                        type: string
+                  album:
+                    type: object
+                    properties:
+                      '#text':
+                        type: string
+                  url:
+                    type: string
+                  image:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        size:
+                          type: string
+                        '#text':
+                          type: string
+
+    LastFMUserResponse:
+      type: object
+      properties:
+        user:
+          type: object
+          properties:
+            name:
+              type: string
+            playcount:
+              type: string
+            artist_count:
+              type: string
+            track_count:
+              type: string
+            album_count:
+              type: string
+            url:
+              type: string
+
+    UserDTO:
+      type: object
+      required:
+        - id
+        - email
+        - username
+        - full_name
+        - provider
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        username:
+          type: string
+        full_name:
+          type: string
+        avatar_url:
+          type: string
+          nullable: true
+        provider:
+          type: string
+          enum: [local, google, github]
+        two_factor_enabled:
+          type: boolean
+          example: false
+        created_at:
+          type: string
+          format: date-time
+
+    RegisterInput:
+      type: object
+      required:
+        - email
+        - username
+        - password
+        - full_name
+      properties:
+        email:
+          type: string
+          format: email
+          example: jane@example.com
+        username:
+          type: string
+          example: janedoe
+        password:
+          type: string
+          format: password
+          minLength: 8
+          example: SecurePassword123!
+        full_name:
+          type: string
+          example: Jane Doe
+        avatar_url:
+          type: string
+          nullable: true
+          example: https://example.com/avatar.png
+
+    LoginInput:
+      type: object
+      required:
+        - identifier
+        - password
+      properties:
+        identifier:
+          type: string
+          description: Username or email address
+          example: janedoe
+        password:
+          type: string
+          format: password
+          example: SecurePassword123!
+
+    Verify2FARequest:
+      type: object
+      required:
+        - temp_token
+        - code
+      properties:
+        temp_token:
+          type: string
+          description: Temporary challenge token issued during initial login
+        code:
+          type: string
+          description: 6-digit TOTP code or emergency backup recovery code
+          example: "123456"
+
+    Setup2FAResponse:
+      type: object
+      required:
+        - status
+        - secret
+        - qr_code
+        - otpauth_url
+      properties:
+        status:
+          type: string
+          example: success
+        secret:
+          type: string
+          description: Base32 TOTP secret string
+          example: JBSWY3DPEHPK3PXP
+        qr_code:
+          type: string
+          description: Base64 data URL PNG image for QR code scanning
+          example: data:image/png;base64,iVBORw0KGgoAAAANSUhEUg...
+        otpauth_url:
+          type: string
+          example: otpauth://totp/Gloom%20HQ:user@example.com?secret=JBSWY3DPEHPK3PXP&issuer=Gloom+HQ
+
+    Enable2FARequest:
+      type: object
+      required:
+        - code
+      properties:
+        code:
+          type: string
+          description: 6-digit TOTP code from authenticator app
+          example: "123456"
+        secret:
+          type: string
+          description: Optional secret if not cached on session
+
+    Enable2FAResponse:
+      type: object
+      required:
+        - status
+        - message
+        - recovery_codes
+      properties:
+        status:
+          type: string
+          example: success
+        message:
+          type: string
+          example: Two-factor authentication has been enabled successfully
+        recovery_codes:
+          type: array
+          items:
+            type: string
+          example: ["A2B4-9F8C", "X7K2-1M9P"]
+
+    Disable2FARequest:
+      type: object
+      properties:
+        code:
+          type: string
+          description: Current 6-digit TOTP code
+          example: "123456"
+        password:
+          type: string
+          description: Account password (fallback if authenticator unavailable)
+          example: "MySecurePassword123!"
+
+    Disable2FAResponse:
+      type: object
+      required:
+        - status
+        - message
+      properties:
+        status:
+          type: string
+          example: success
+        message:
+          type: string
+          example: Two-factor authentication has been disabled successfully
+
+    UpdateProfileInput:
+      type: object
+      properties:
+        full_name:
+          type: string
+          example: Jane Smith
+        avatar_url:
+          type: string
+          example: https://example.com/new-avatar.png
+
+    AuthResponse:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          example: success
+        message:
+          type: string
+          example: Login successful
+        token:
+          type: string
+          description: PASETO v2.local symmetric token
+          example: v2.local.k7x...
+        two_factor_required:
+          type: boolean
+          example: false
+        temp_token:
+          type: string
+          description: Short-lived challenge token if 2FA verification is required
+        user:
+          $ref: '#/components/schemas/UserDTO'
+
+    ProfileResponse:
+      type: object
+      required:
+        - status
+        - user
+      properties:
+        status:
+          type: string
+          example: success
+        message:
+          type: string
+        user:
+          $ref: '#/components/schemas/UserDTO'
+
+    CheckAvailabilityResponse:
+      type: object
+      properties:
+        username_available:
+          type: boolean
+          example: true
+        email_available:
+          type: boolean
+          example: true
+        username_reason:
+          type: string
+          example: Username is already taken
+        email_reason:
+          type: string
+          example: Email is already registered
+
+    SetPasswordInput:
+      type: object
+      required:
+        - new_password
+      properties:
+        current_password:
+          type: string
+          format: password
+          description: Required only if user already has a password
+        new_password:
+          type: string
+          format: password
+          minLength: 8
+          example: NewSecurePass123!
+
+    GenericSuccessResponse:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          example: success
+        message:
+          type: string
+          example: Operation completed successfully
+
+    PostSummaryDTO:
+      type: object
+      required:
+        - id
+        - slug
+        - title
+        - description
+        - tags
+        - reading_time
+        - is_published
+        - published_at
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        slug:
+          type: string
+          example: all-black-and-heavywear
+        title:
+          type: string
+          example: The Weight of Black
+        description:
+          type: string
+          example: Black is cool, you know.
+        tags:
+          type: array
+          items:
+            type: string
+          example: ["Essay", "Philosophy"]
+        cover_image:
+          type: string
+          nullable: true
+        reading_time:
+          type: string
+          example: 21 min read
+        is_published:
+          type: boolean
+          example: true
+        published_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    PostDTO:
+      type: object
+      required:
+        - id
+        - slug
+        - title
+        - description
+        - content
+        - tags
+        - reading_time
+        - is_published
+        - published_at
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        slug:
+          type: string
+          example: all-black-and-heavywear
+        title:
+          type: string
+          example: The Weight of Black
+        description:
+          type: string
+          example: Black is cool, you know.
+        content:
+          type: string
+          description: Raw markdown or MDX content
+          example: "# The Weight of Black\n\nContent..."
+        tags:
+          type: array
+          items:
+            type: string
+          example: ["Essay", "Philosophy"]
+        cover_image:
+          type: string
+          nullable: true
+        reading_time:
+          type: string
+          example: 21 min read
+        is_published:
+          type: boolean
+          example: true
+        published_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    CreatePostRequest:
+      type: object
+      required:
+        - title
+        - content
+      properties:
+        slug:
+          type: string
+          description: URL slug (auto-generated from title if omitted)
+          example: new-article-slug
+        title:
+          type: string
+          example: Title of the article
+        description:
+          type: string
+          example: Brief overview
+        content:
+          type: string
+          example: "# Markdown body"
+        tags:
+          type: array
+          items:
+            type: string
+          example: ["Guide", "Tech"]
+        cover_image:
+          type: string
+          nullable: true
+        is_published:
+          type: boolean
+          default: true
+        published_at:
+          type: string
+          format: date-time
+
+    UpdatePostRequest:
+      type: object
+      properties:
+        slug:
+          type: string
+        title:
+          type: string
+        description:
+          type: string
+        content:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        cover_image:
+          type: string
+          nullable: true
+        is_published:
+          type: boolean
+        published_at:
+          type: string
+          format: date-time
+
+    PostsListResponse:
+      type: object
+      required:
+        - total
+        - posts
+      properties:
+        total:
+          type: integer
+          example: 5
+        posts:
+          type: array
+          items:
+            $ref: '#/components/schemas/PostSummaryDTO'
+
+    TrackEventRequest:
+      type: object
+      required:
+        - path
+      properties:
+        path:
+          type: string
+          example: /blog/markdown-test
+        title:
+          type: string
+          example: Markdown Test Post
+        post_slug:
+          type: string
+          example: markdown-test
+        referrer:
+          type: string
+          example: https://google.com
+        screen_resolution:
+          type: string
+          example: 1920x1080
+        session_id:
+          type: string
+          example: c8f31b20-9118-4b72-b521-d779e51c8a14
+
+    TrackEventResponse:
+      type: object
+      required:
+        - status
+        - message
+      properties:
+        status:
+          type: string
+          example: success
+        message:
+          type: string
+          example: event recorded
+
+    TrendPoint:
+      type: object
+      required:
+        - bucket
+        - views
+        - visitors
+      properties:
+        bucket:
+          type: string
+          example: 2026-10-05 14:00
+        views:
+          type: integer
+          example: 42
+        visitors:
+          type: integer
+          example: 18
+
+    PageStat:
+      type: object
+      required:
+        - path
+        - views
+        - visitors
+      properties:
+        path:
+          type: string
+          example: /blog/markdown-test
+        title:
+          type: string
+          example: Markdown Test Post
+        views:
+          type: integer
+          example: 120
+        visitors:
+          type: integer
+          example: 75
+
+    PostStat:
+      type: object
+      required:
+        - post_slug
+        - views
+        - visitors
+      properties:
+        post_slug:
+          type: string
+          example: markdown-test
+        views:
+          type: integer
+          example: 85
+        visitors:
+          type: integer
+          example: 50
+
+    ReferrerStat:
+      type: object
+      required:
+        - referrer
+        - views
+      properties:
+        referrer:
+          type: string
+          example: https://github.com
+        views:
+          type: integer
+          example: 34
+
+    DeviceStat:
+      type: object
+      required:
+        - device_type
+        - count
+      properties:
+        device_type:
+          type: string
+          example: desktop
+        count:
+          type: integer
+          example: 120
+
+    BrowserStat:
+      type: object
+      required:
+        - browser
+        - count
+      properties:
+        browser:
+          type: string
+          example: Chrome
+        count:
+          type: integer
+          example: 88
+
+    RecentPageView:
+      type: object
+      required:
+        - id
+        - path
+        - device_type
+        - browser
+        - os
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        path:
+          type: string
+        title:
+          type: string
+        post_slug:
+          type: string
+        referrer:
+          type: string
+        device_type:
+          type: string
+        browser:
+          type: string
+        os:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    AnalyticsStatsResponse:
+      type: object
+      required:
+        - period
+        - total_views
+        - unique_visitors
+        - trend
+      properties:
+        period:
+          type: string
+          example: 30d
+        total_views:
+          type: integer
+          example: 1240
+        unique_visitors:
+          type: integer
+          example: 580
+        avg_views_per_visitor:
+          type: number
+          format: double
+          example: 2.14
+        trend:
+          type: array
+          items:
+            $ref: '#/components/schemas/TrendPoint'
+        top_pages:
+          type: array
+          items:
+            $ref: '#/components/schemas/PageStat'
+        top_posts:
+          type: array
+          items:
+            $ref: '#/components/schemas/PostStat'
+        top_referrers:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReferrerStat'
+        devices:
+          type: array
+          items:
+            $ref: '#/components/schemas/DeviceStat'
+        browsers:
+          type: array
+          items:
+            $ref: '#/components/schemas/BrowserStat'
+        recent_views:
+          type: array
+          items:
+            $ref: '#/components/schemas/RecentPageView'
+
