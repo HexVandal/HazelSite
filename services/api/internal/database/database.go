@@ -1,0 +1,269 @@
+package database
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"time"
+
+	"github.com/exaring/otelpgx"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type DB struct {
+	Pool *pgxpool.Pool
+}
+
+func Connect(ctx context.Context, databaseURL string) (*DB, error) {
+	config, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse database config: %w", err)
+	}
+
+	config.ConnConfig.Tracer = otelpgx.NewTracer()
+	config.MaxConns = 25
+	config.MinConns = 2
+	config.MaxConnLifetime = 1 * time.Hour
+	config.MaxConnIdleTime = 30 * time.Minute
+
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		return nil, fmt.Errorf("unable to connect to database: %w", err)
+	}
+
+	// Verify connection with ping
+	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := pool.Ping(pingCtx); err != nil {
+		return nil, fmt.Errorf("database ping failed: %w", err)
+	}
+
+	db := &DB{Pool: pool}
+
+	// Initialize tables
+	if err := db.migrate(ctx); err != nil {
+		return nil, fmt.Errorf("failed to run database migration: %w", err)
+	}
+
+	slog.Info("Database connection pool established successfully")
+	return db, nil
+}
+
+func (db *DB) Close() {
+	if db.Pool != nil {
+		db.Pool.Close()
+	}
+}
+
+func (db *DB) Ping(ctx context.Context) error {
+	if db.Pool == nil {
+		return errors.New("database pool is nil")
+	}
+	return db.Pool.Ping(ctx)
+}
+
+func (db *DB) migrate(ctx context.Context) error {
+	query := `
+	CREATE TABLE IF NOT EXISTS contact_submissions (
+		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+		name VARCHAR(100) NOT NULL,
+		email VARCHAR(255) NOT NULL,
+		subject VARCHAR(200) NOT NULL,
+		message TEXT NOT NULL,
+		ip_address VARCHAR(45),
+		user_agent TEXT,
+		created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_contact_submissions_created_at ON contact_submissions(created_at DESC);
+
+	CREATE TABLE IF NOT EXISTS files (
+		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+		filename VARCHAR(255) NOT NULL,
+		content_type VARCHAR(100) NOT NULL,
+		original_size BIGINT NOT NULL,
+		compressed_size BIGINT NOT NULL,
+		compression_algorithm VARCHAR(20) NOT NULL DEFAULT 'zstd',
+		sha256 VARCHAR(64) NOT NULL,
+		blurhash VARCHAR(100),
+		width INT,
+		height INT,
+		is_public BOOLEAN NOT NULL DEFAULT true,
+		created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_files_created_at ON files(created_at DESC);
+	CREATE INDEX IF NOT EXISTS idx_files_sha256 ON files(sha256);
+
+	CREATE TABLE IF NOT EXISTS api_tokens (
+		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+		name VARCHAR(100) NOT NULL,
+		token_prefix VARCHAR(50) NOT NULL,
+		token_hash VARCHAR(64) NOT NULL UNIQUE,
+		scopes TEXT[] NOT NULL DEFAULT '{"*"}',
+		rate_limit_rpm INT NOT NULL DEFAULT 60,
+		last_used_at TIMESTAMP WITH TIME ZONE,
+		expires_at TIMESTAMP WITH TIME ZONE,
+		is_revoked BOOLEAN NOT NULL DEFAULT false,
+		created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+	);
+	ALTER TABLE api_tokens ALTER COLUMN token_prefix TYPE VARCHAR(50);
+	CREATE INDEX IF NOT EXISTS idx_api_tokens_token_hash ON api_tokens(token_hash);
+	CREATE INDEX IF NOT EXISTS idx_api_tokens_is_revoked ON api_tokens(is_revoked);
+
+	CREATE TABLE IF NOT EXISTS users (
+		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+		email VARCHAR(255) NOT NULL UNIQUE,
+		username VARCHAR(50) NOT NULL UNIQUE,
+		full_name VARCHAR(100) NOT NULL,
+		password_hash VARCHAR(255),
+		avatar_url TEXT,
+		provider VARCHAR(30) NOT NULL DEFAULT 'local',
+		provider_id VARCHAR(255),
+		created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+		updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+	);
+	ALTER TABLE users ADD COLUMN IF NOT EXISTS two_factor_enabled BOOLEAN NOT NULL DEFAULT false;
+	ALTER TABLE users ADD COLUMN IF NOT EXISTS two_factor_secret TEXT;
+	ALTER TABLE users ADD COLUMN IF NOT EXISTS two_factor_recovery_codes TEXT[] DEFAULT '{}';
+	ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT true;
+	CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+	CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
+	CREATE INDEX IF NOT EXISTS idx_users_provider ON users(provider, provider_id);
+	CREATE INDEX IF NOT EXISTS idx_users_is_active ON users(is_active);
+
+	CREATE TABLE IF NOT EXISTS user_oauth_accounts (
+		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+		user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		provider VARCHAR(30) NOT NULL,
+		provider_id VARCHAR(255) NOT NULL,
+		email VARCHAR(255),
+		avatar_url TEXT,
+		created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+		UNIQUE(provider, provider_id),
+		UNIQUE(user_id, provider)
+	);
+	ALTER TABLE user_oauth_accounts ADD COLUMN IF NOT EXISTS avatar_url TEXT;
+	CREATE INDEX IF NOT EXISTS idx_user_oauth_accounts_user_id ON user_oauth_accounts(user_id);
+	CREATE INDEX IF NOT EXISTS idx_user_oauth_accounts_provider ON user_oauth_accounts(provider, provider_id);
+
+
+	-- Posts Table (Articles managed by HQ, served by realm-reference)
+	CREATE TABLE IF NOT EXISTS posts (
+		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+		slug VARCHAR(200) UNIQUE NOT NULL,
+		title VARCHAR(255) NOT NULL,
+		description TEXT NOT NULL DEFAULT '',
+		content TEXT NOT NULL DEFAULT '',
+		tags TEXT[] NOT NULL DEFAULT '{}',
+		cover_image TEXT,
+		reading_time VARCHAR(50) DEFAULT '1 min read',
+		is_published BOOLEAN NOT NULL DEFAULT true,
+		published_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+		created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+		updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_posts_slug ON posts(slug);
+	CREATE INDEX IF NOT EXISTS idx_posts_published ON posts(is_published, published_at DESC);
+
+	-- Admin RBAC Table
+	CREATE TABLE IF NOT EXISTS admin_users (
+		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+		user_id UUID NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+		is_superadmin BOOLEAN NOT NULL DEFAULT false,
+		permissions TEXT[] NOT NULL DEFAULT '{}',
+		created_by UUID REFERENCES users(id),
+		created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+		updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_admin_users_user_id ON admin_users(user_id);
+	CREATE INDEX IF NOT EXISTS idx_admin_users_is_superadmin ON admin_users(is_superadmin);
+
+	-- Dedicated Structured Logs Table
+	CREATE TABLE IF NOT EXISTS system_logs (
+		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+		timestamp TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+		level VARCHAR(10) NOT NULL,
+		message TEXT NOT NULL,
+		component VARCHAR(50),
+		trace_id VARCHAR(64),
+		span_id VARCHAR(32),
+		attributes JSONB DEFAULT '{}'::jsonb
+	);
+	CREATE INDEX IF NOT EXISTS idx_system_logs_timestamp ON system_logs(timestamp DESC);
+	CREATE INDEX IF NOT EXISTS idx_system_logs_level ON system_logs(level);
+	CREATE INDEX IF NOT EXISTS idx_system_logs_trace_id ON system_logs(trace_id);
+	CREATE INDEX IF NOT EXISTS idx_system_logs_component ON system_logs(component);
+
+	-- S3 Storage Columns on files Table
+	ALTER TABLE files ADD COLUMN IF NOT EXISTS storage_backend VARCHAR(20) DEFAULT 'local';
+	ALTER TABLE files ADD COLUMN IF NOT EXISTS s3_bucket VARCHAR(100);
+	ALTER TABLE files ADD COLUMN IF NOT EXISTS s3_key VARCHAR(500);
+	ALTER TABLE files ADD COLUMN IF NOT EXISTS s3_etag VARCHAR(100);
+
+	-- Analytics / Page Views Table
+	CREATE TABLE IF NOT EXISTS page_views (
+		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+		site VARCHAR(100) NOT NULL DEFAULT '',
+		country_code VARCHAR(10),
+		country VARCHAR(100),
+		path VARCHAR(512) NOT NULL,
+		post_slug VARCHAR(255),
+		referrer VARCHAR(1024),
+		user_agent VARCHAR(1024),
+		browser VARCHAR(100),
+		os VARCHAR(100),
+		device_type VARCHAR(50),
+		session_id VARCHAR(100),
+		screen_resolution VARCHAR(50),
+		ip_hash VARCHAR(64),
+		created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+	);
+	ALTER TABLE page_views ADD COLUMN IF NOT EXISTS site VARCHAR(100) DEFAULT '';
+	ALTER TABLE page_views ADD COLUMN IF NOT EXISTS country_code VARCHAR(10);
+	ALTER TABLE page_views ADD COLUMN IF NOT EXISTS country VARCHAR(100);
+	CREATE INDEX IF NOT EXISTS idx_page_views_created_at ON page_views (created_at DESC);
+	CREATE INDEX IF NOT EXISTS idx_page_views_path ON page_views (path);
+	CREATE INDEX IF NOT EXISTS idx_page_views_post_slug ON page_views (post_slug) WHERE post_slug IS NOT NULL;
+	CREATE INDEX IF NOT EXISTS idx_page_views_session ON page_views (session_id);
+	CREATE INDEX IF NOT EXISTS idx_page_views_site ON page_views (site);
+	CREATE INDEX IF NOT EXISTS idx_page_views_country_code ON page_views (country_code);
+
+	`
+
+	_, err := db.Pool.Exec(ctx, query)
+	return err
+}
+
+// BootstrapSuperadmins ensures that all users matching the configured superadmin emails
+// are granted superadmin status in admin_users with all permissions.
+func (db *DB) BootstrapSuperadmins(ctx context.Context, superadminEmails []string) error {
+	if len(superadminEmails) == 0 {
+		return nil
+	}
+
+	for _, email := range superadminEmails {
+		trimmed := strings.ToLower(strings.TrimSpace(email))
+		if trimmed == "" {
+			continue
+		}
+
+		query := `
+		INSERT INTO admin_users (user_id, is_superadmin, permissions)
+		SELECT id, true, ARRAY['*']
+		FROM users
+		WHERE LOWER(email) = $1
+		ON CONFLICT (user_id) DO UPDATE
+		SET is_superadmin = true, permissions = ARRAY['*'], updated_at = NOW();
+		`
+		res, err := db.Pool.Exec(ctx, query, trimmed)
+		if err != nil {
+			slog.Error("Failed to bootstrap superadmin", "email", trimmed, "error", err)
+			continue
+		}
+		if res.RowsAffected() > 0 {
+			slog.Info("Superadmin bootstrapped successfully", "email", trimmed)
+		}
+	}
+	return nil
+}
