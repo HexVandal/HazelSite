@@ -1,7 +1,136 @@
+import { get, put } from "@vercel/blob";
+import { createHash, randomUUID } from "node:crypto";
 import { NextResponse, type NextRequest } from "next/server";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+
+const ANALYTICS_PREFIX = "analytics/visits";
+const MAX_EVENTS_PER_DAY = 1500;
+
+type StoredVisit = {
+  id: string;
+  timestamp: string;
+  path: string;
+  referrer: string;
+  visitor: string;
+  country_code: string;
+  country: string;
+  region: string;
+  city: string;
+  latitude: number | null;
+  longitude: number | null;
+  isp: string;
+  browser: string;
+  os: string;
+  device: string;
+  site: string;
+};
+
+function shortString(value: unknown, max = 120): string {
+  if (typeof value !== "string") return "";
+  return value.replace(/[\r\n\u0000-\u001f]/g, " ").trim().slice(0, max);
+}
+
+function numberOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function detectBrowser(ua: string): string {
+  if (/Edg\//i.test(ua)) return "Edge";
+  if (/OPR\/|Opera/i.test(ua)) return "Opera";
+  if (/SamsungBrowser/i.test(ua)) return "Samsung Internet";
+  if (/Firefox\/|FxiOS/i.test(ua)) return "Firefox";
+  if (/Chrome\/|CriOS/i.test(ua)) return "Chrome";
+  if (/Safari\//i.test(ua)) return "Safari";
+  return "Unknown";
+}
+
+function detectOs(ua: string): string {
+  if (/Windows NT/i.test(ua)) return "Windows";
+  if (/Android/i.test(ua)) return "Android";
+  if (/iPhone|iPad|iPod/i.test(ua)) return "iOS";
+  if (/Mac OS X/i.test(ua)) return "macOS";
+  if (/CrOS/i.test(ua)) return "ChromeOS";
+  if (/Linux/i.test(ua)) return "Linux";
+  return "Unknown";
+}
+
+function detectDevice(ua: string): string {
+  if (/iPad|Tablet/i.test(ua)) return "Tablet";
+  if (/Mobi|Android|iPhone/i.test(ua)) return "Mobile";
+  return "Desktop";
+}
+
+async function persistVisit(
+  details: VisitDetails,
+  ipInfo: Record<string, unknown>,
+  browserInfo: Record<string, unknown>,
+): Promise<void> {
+  const token = process.env.CONTENT_BLOB_READ_WRITE_TOKEN;
+  if (!token) return;
+
+  const timestamp = new Date().toISOString();
+  const day = timestamp.slice(0, 10);
+  const userAgent = shortString(browserInfo.userAgent, 300);
+  const ip = shortString(ipInfo.ip, 60);
+
+  // Unlinkable daily visitor id: same person twice today, different person tomorrow.
+  const visitor = createHash("sha256")
+    .update(`${ip}|${userAgent}|${day}`)
+    .digest("hex")
+    .slice(0, 16);
+
+  const event: StoredVisit = {
+    id: randomUUID(),
+    timestamp,
+    path: shortString(details.path, 160) || "/",
+    referrer: shortString(details.referrer, 300),
+    visitor,
+    country_code: shortString(ipInfo.country_code, 4).toUpperCase(),
+    country: shortString(ipInfo.country_name, 80),
+    region: shortString(ipInfo.region, 80),
+    city: shortString(ipInfo.city, 80),
+    latitude: numberOrNull(ipInfo.latitude),
+    longitude: numberOrNull(ipInfo.longitude),
+    isp: shortString(ipInfo.org, 120),
+    browser: detectBrowser(userAgent),
+    os: detectOs(userAgent),
+    device: detectDevice(userAgent),
+    site: "hazel-vampyr.vercel.app",
+  };
+
+  const pathname = `${ANALYTICS_PREFIX}/${day}.json`;
+  let dayFile: { date: string; events: StoredVisit[] } = { date: day, events: [] };
+
+  try {
+    const existing = await get(pathname, { access: "private", token, useCache: false });
+    if (existing?.statusCode === 200 && existing.stream) {
+      const parsed = JSON.parse(await new Response(existing.stream).text()) as {
+        events?: StoredVisit[];
+      };
+      if (Array.isArray(parsed?.events)) {
+        dayFile = { date: day, events: parsed.events };
+      }
+    }
+  } catch {
+    // Missing or unreadable day file: start a fresh one.
+  }
+
+  dayFile.events.push(event);
+  if (dayFile.events.length > MAX_EVENTS_PER_DAY) {
+    dayFile.events = dayFile.events.slice(-MAX_EVENTS_PER_DAY);
+  }
+
+  await put(pathname, JSON.stringify(dayFile), {
+    access: "private",
+    token,
+    addRandomSuffix: false,
+    allowOverwrite: true,
+    contentType: "application/json; charset=utf-8",
+    cacheControlMaxAge: 0,
+  });
+}
 
 const WINDOW_MS = 60_000;
 const MAX_EVENTS_PER_WINDOW = 30;
@@ -74,6 +203,13 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ ok: false }, { status: 429 });
   }
   eventsInWindow += 1;
+
+  // Persist telemetry for the HQ analytics globe. Never blocks the Telegram ping.
+  try {
+    await persistVisit(details, details.ipInfo ?? {}, details.browser ?? {});
+  } catch (error) {
+    console.error("Unable to persist visit analytics", error);
+  }
 
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;

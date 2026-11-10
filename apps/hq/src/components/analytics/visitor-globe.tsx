@@ -21,6 +21,11 @@ interface CountryStat {
   views: number;
   unique: number;
   percentage: number;
+  /** Exact visitor coordinates, when the tracking layer resolved a city. */
+  lat?: number;
+  long?: number;
+  /** Stable marker identity so one country can render several city pins. */
+  key?: string;
 }
 
 interface VisitorGlobeProps {
@@ -99,6 +104,23 @@ function getFlagEmoji(countryCode: string): string {
   return String.fromCodePoint(...codePoints);
 }
 
+// Prefer real visitor coordinates; fall back to the country centroid table.
+function coordsFor(stat: CountryStat): [number, number] | null {
+  if (
+    typeof stat.lat === "number" &&
+    typeof stat.long === "number" &&
+    Number.isFinite(stat.lat) &&
+    Number.isFinite(stat.long)
+  ) {
+    return [stat.lat, stat.long];
+  }
+  return COUNTRY_COORDINATES[stat.country_code?.toUpperCase() ?? ""] ?? null;
+}
+
+function markerId(stat: CountryStat): string {
+  return stat.key ?? (stat.country_code || "XX").toUpperCase();
+}
+
 // Project [latitude, longitude] onto 2D screen percentage for DOM beacons
 function projectGeoToScreen(
   latDeg: number,
@@ -173,8 +195,8 @@ export function VisitorGlobe({
   }, [countryStats]);
 
   // Smoothly center the globe on the selected country
-  const rotateToCountry = React.useCallback((code: string) => {
-    const coords = COUNTRY_COORDINATES[code.toUpperCase()];
+  const rotateToCountry = React.useCallback((stat: CountryStat) => {
+    const coords = coordsFor(stat);
     if (!coords) return;
     const targetPhi = -(coords[1] * Math.PI) / 180 - Math.PI / 2;
     const targetTheta = Math.max(
@@ -182,7 +204,7 @@ export function VisitorGlobe({
       Math.min(0.5, ((coords[0] * Math.PI) / 180) * 0.6),
     );
     targetRotationRef.current = [targetPhi, targetTheta];
-    setSelectedCountryCode(code);
+    setSelectedCountryCode(markerId(stat));
     setIsAutoSpinning(false);
   }, []);
 
@@ -244,10 +266,10 @@ export function VisitorGlobe({
       // Synchronize DOM overlay pulsing point beacon coordinates in 60fps loop
       for (let idx = 0; idx < countryStats.length; idx++) {
         const stat = countryStats[idx];
-        const coords = COUNTRY_COORDINATES[stat.country_code.toUpperCase()];
+        const coords = coordsFor(stat);
         if (!coords) continue;
 
-        const domEl = markerElementsRef.current[stat.country_code];
+        const domEl = markerElementsRef.current[markerId(stat)];
         if (domEl) {
           const proj = projectGeoToScreen(
             coords[0],
@@ -390,33 +412,31 @@ export function VisitorGlobe({
             {/* Informative Floating Country Beacons */}
             <div className="absolute inset-0 pointer-events-none z-20 overflow-visible">
               {countryStats.map((stat, idx) => {
-                const coords =
-                  COUNTRY_COORDINATES[stat.country_code.toUpperCase()];
+                const coords = coordsFor(stat);
                 if (!coords) return null;
 
+                const id = markerId(stat);
                 const ratio = Math.min(1, stat.views / maxViews);
-                const isSelected = selectedCountryCode === stat.country_code;
-                const isHovered = hoveredCountryCode === stat.country_code;
+                const isSelected = selectedCountryCode === id;
+                const isHovered = hoveredCountryCode === id;
                 const pulseLightness = 42 + ratio * 42;
 
                 return (
                   <button
                     type="button"
-                    key={stat.country_code}
+                    key={id}
                     ref={(el) => {
-                      markerElementsRef.current[stat.country_code] = el;
+                      markerElementsRef.current[id] = el;
                     }}
                     style={{ display: "none" }}
                     className="absolute -translate-x-1/2 -translate-y-1/2 pointer-events-auto group cursor-pointer transition-transform duration-200 border-0 bg-transparent p-0 focus:outline-hidden"
-                    onClick={() => rotateToCountry(stat.country_code)}
+                    onClick={() => rotateToCountry(stat)}
                     onKeyDown={(e) => {
                       if (e.key === "Enter" || e.key === " ") {
-                        rotateToCountry(stat.country_code);
+                        rotateToCountry(stat);
                       }
                     }}
-                    onMouseEnter={() =>
-                      setHoveredCountryCode(stat.country_code)
-                    }
+                    onMouseEnter={() => setHoveredCountryCode(id)}
                     onMouseLeave={() => setHoveredCountryCode(null)}
                     aria-label={`Focus on ${stat.country || stat.country_code}`}
                   >
@@ -528,26 +548,23 @@ export function VisitorGlobe({
                 const ratio = Math.min(1, item.views / maxViews);
                 // Dynamic lightness from 38% to 80%
                 const barLightness = 38 + ratio * 42;
-                const isSelected = selectedCountryCode === item.country_code;
-                const isHovered = hoveredCountryCode === item.country_code;
-                const hasCoords = Boolean(
-                  COUNTRY_COORDINATES[item.country_code.toUpperCase()],
-                );
+                const itemId = markerId(item);
+                const isSelected = selectedCountryCode === itemId;
+                const isHovered = hoveredCountryCode === itemId;
+                const hasCoords = Boolean(coordsFor(item));
 
                 return (
                   <button
                     type="button"
-                    key={item.country_code}
+                    key={itemId}
                     onClick={() => {
                       if (hasCoords) {
-                        rotateToCountry(item.country_code);
+                        rotateToCountry(item);
                       } else {
-                        setSelectedCountryCode(item.country_code);
+                        setSelectedCountryCode(itemId);
                       }
                     }}
-                    onMouseEnter={() =>
-                      setHoveredCountryCode(item.country_code)
-                    }
+                    onMouseEnter={() => setHoveredCountryCode(itemId)}
                     onMouseLeave={() => setHoveredCountryCode(null)}
                     className={cn(
                       "w-full flex flex-col gap-1.5 p-3 text-left transition-colors cursor-pointer hover:bg-muted/40",
