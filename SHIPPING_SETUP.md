@@ -166,44 +166,64 @@ If the build runs out of memory, raise the heap: `NODE_OPTIONS=--max-old-space-s
 
 ---
 
-## 7. Publish to a new GitHub repository
+## 7. Publish the code to GitHub
 
-The working copy already contains a committed repository (branch `main`, one commit, clean tree).
-`.gitignore` excludes `node_modules`, `.next`, `.env*` (except `.env.example`), `.vercel`, and
-`*.tsbuildinfo`, so no local secrets or build output can be pushed.
+The working copy is a real repository. `.gitignore` excludes `node_modules`, `.next`, `.env*`
+(except `.env.example`), `.vercel`, and `*.tsbuildinfo`, so no local secrets or build output can be
+pushed. Keep the repository **private** — the HQ source reveals your auth design.
 
-**Recommended: private repository**, since the HQ's source reveals your auth design.
+### Option A — push to the existing repo as a new branch (recommended)
 
-### Option A — GitHub CLI (creates the repo and pushes in one step)
+This branch is already prepared locally: `vercel-only`, built on top of the repo's current `main`
+so history stays connected.
+
+**If you already have a clone of the repo:**
+
+```bash
+cd /path/to/HazelSite
+git fetch /path/to/hazelsite-vercel-only.bundle vercel-only:vercel-only
+git push origin vercel-only
+```
+
+Then open a pull request from `vercel-only` into `main`, or deploy that branch directly.
+
+**If you do not have a clone**, clone the bundle first, then push it to GitHub:
+
+```bash
+git clone -b vercel-only /path/to/hazelsite-vercel-only.bundle HazelSite
+cd HazelSite
+git remote set-url origin https://github.com/<your-username>/HazelSite.git
+git push -u origin vercel-only
+```
+
+The bundle records complete history, so the pushed branch shares the repo's `main` ancestry instead
+of looking like an unrelated import.
+
+### Option B — a brand new repository
 
 ```bash
 cd HazelSite2
 gh auth login                       # once per machine
-gh repo create HazelSite2 --private --source=. --remote=origin --push
+gh repo create HazelSite --private --source=. --remote=origin --push
 ```
 
-### Option B — github.com
-
-1. Open <https://github.com/new>, name it e.g. `HazelSite2`, choose **Private**, and do **not**
-   initialise it with a README, `.gitignore`, or licence.
-2. Then:
+Or on github.com: create the repo **Private**, with no README/.gitignore/licence, then:
 
 ```bash
 cd HazelSite2
-git remote add origin git@github.com:<your-username>/HazelSite2.git   # or the HTTPS URL
-git branch -M main
-git push -u origin main
+git remote add origin git@github.com:<your-username>/HazelSite.git
+git push -u origin vercel-only
 ```
 
 ### Before you push, confirm nothing private is staged
 
 ```bash
-git status --short          # expect no output
-git ls-files | grep -E '\.env' # expect only the .env.example files
+git status --short              # expect no output
+git ls-files | grep -E '\.env'  # expect only the .env.example files
 ```
 
-If you ever commit a real `.env` file, rotate every value in it — removing it in a later commit does
-not remove it from history.
+If a real `.env` file ever gets committed, rotate every value in it — deleting it in a later commit
+does not remove it from history.
 
 ### Optional: drop the legacy services
 
