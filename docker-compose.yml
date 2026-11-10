@@ -1,0 +1,133 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-hazel}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-hazel}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api-db-init:
+    image: postgres:17-alpine
+    restart: "no"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-hazel}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    entrypoint: ["sh", "-c"]
+    command:
+      - >-
+        until pg_isready -h postgres -U "$${POSTGRES_USER}"; do sleep 2; done;
+        if ! psql -h postgres -U "$${POSTGRES_USER}" -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='realm_api'" | grep -q 1; then
+        psql -h postgres -U "$${POSTGRES_USER}" -d postgres -c "CREATE DATABASE realm_api OWNER $${POSTGRES_USER}";
+        fi
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build:
+      context: ./services/api
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      PORT: "8080"
+      GRPC_PORT: "50051"
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000,http://localhost:3001}
+      DATABASE_URL: postgres://${POSTGRES_USER:-hazel}:${POSTGRES_PASSWORD}@postgres:5432/realm_api?sslmode=disable
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+      STORAGE_DIR: /data/storage
+      PASETO_SYMMETRIC_KEY: ${PASETO_SYMMETRIC_KEY:?Set a generated PASETO_SYMMETRIC_KEY in .env}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+      SUPERADMIN_EMAILS: ${SUPERADMIN_EMAILS:-}
+      S3_ENDPOINT: ${S3_ENDPOINT:-}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_BUCKET: ${S3_BUCKET:-hazelsite-assets}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+      S3_USE_PATH_STYLE: ${S3_USE_PATH_STYLE:-true}
+      S3_PUBLIC_DOMAIN: ${S3_PUBLIC_DOMAIN:-}
+      LASTFM_API_KEY: ${LASTFM_API_KEY:-}
+      LASTFM_API_SECRET: ${LASTFM_API_SECRET:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
+      CONTACT_RECEIVER_EMAIL: ${CONTACT_RECEIVER_EMAIL:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+    ports:
+      - "8080:8080"
+      - "50051:50051"
+    volumes:
+      - apistorage:/data/storage
+    depends_on:
+      api-db-init:
+        condition: service_completed_successfully
+
+  hazelsite-migrate:
+    build:
+      context: ./apps/site
+      dockerfile: Dockerfile
+    restart: "no"
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-hazel}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-hazel}?sslmode=disable
+    command: ["npm","run","db:migrate"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  website:
+    build:
+      context: ./apps/site
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      GLOOM_API_INTERNAL_URL: http://api:8080
+      NEXT_PUBLIC_SITE_URL: ${NEXT_PUBLIC_SITE_URL:-http://localhost:3000}
+      HQ_URL: ${HQ_URL:-http://localhost:3001}
+      DATABASE_URL: postgres://${POSTGRES_USER:-hazel}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-hazel}?sslmode=disable
+      SESSION_SECRET: ${SESSION_SECRET:?Set a random SESSION_SECRET in .env}
+      ADMIN_SETUP_TOKEN: ${ADMIN_SETUP_TOKEN:-}
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_started
+      hazelsite-migrate:
+        condition: service_completed_successfully
+
+  hq:
+    build:
+      context: ./apps/hq
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      CI: "true"
+      API_URL: http://api:8080
+      NEXT_PUBLIC_SITE_NAME: Gloom HQ
+      NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_HQ_URL:-http://localhost:3001}
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8080}
+      NEXT_PUBLIC_BLOG_URL: ${NEXT_PUBLIC_SITE_URL:-http://localhost:3000}
+      GRPC_API_URL: api:50051
+      API_TOKEN: ${API_TOKEN:-}
+      SUPERADMIN_EMAILS: ${SUPERADMIN_EMAILS:-}
+    ports:
+      - "3001:3000"
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
+  apistorage:

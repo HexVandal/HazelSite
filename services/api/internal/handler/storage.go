@@ -1,0 +1,278 @@
+package handler
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"mime"
+	"net/http"
+	"path/filepath"
+	"strconv"
+	"strings"
+
+	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
+	"github.com/irvanmalik48/realm-api/internal/config"
+	"github.com/irvanmalik48/realm-api/internal/model"
+	"github.com/irvanmalik48/realm-api/internal/repository"
+	"github.com/irvanmalik48/realm-api/internal/service"
+	"github.com/irvanmalik48/realm-api/internal/storage"
+)
+
+type StorageHandler struct {
+	cfg     *config.Config
+	service service.StorageService
+}
+
+func NewStorageHandler(cfg *config.Config, svc service.StorageService) *StorageHandler {
+	return &StorageHandler{
+		cfg:     cfg,
+		service: svc,
+	}
+}
+
+func (h *StorageHandler) Upload(c *fiber.Ctx) error {
+	contentType := c.Get("Content-Type")
+	lowerContentType := strings.ToLower(contentType)
+
+	if strings.HasPrefix(lowerContentType, "application/json") || strings.Contains(lowerContentType, "json") {
+		return ErrorResponse(c, "Upload requests must be binary. JSON payloads are not allowed.", http.StatusBadRequest)
+	}
+
+	var (
+		filename     string
+		srcFile      io.Reader
+		explicitType string
+	)
+
+	if strings.HasPrefix(lowerContentType, "multipart/form-data") {
+		fileHeader, err := c.FormFile("file")
+		if err != nil {
+			return ErrorResponse(c, "No file uploaded. Please provide a 'file' form field.", http.StatusBadRequest)
+		}
+
+		f, err := fileHeader.Open()
+		if err != nil {
+			return ErrorResponse(c, "Failed to open uploaded file", http.StatusBadRequest)
+		}
+		defer f.Close()
+
+		filename = fileHeader.Filename
+		srcFile = f
+		explicitType = fileHeader.Header.Get("Content-Type")
+	} else {
+		body := c.Body()
+		if len(body) == 0 {
+			return ErrorResponse(c, "No file uploaded. Request body is empty.", http.StatusBadRequest)
+		}
+		srcFile = bytes.NewReader(body)
+		explicitType = contentType
+
+		if disp := c.Get("Content-Disposition"); disp != "" {
+			if _, params, err := mime.ParseMediaType(disp); err == nil {
+				if fn, ok := params["filename"]; ok && fn != "" {
+					filename = filepath.Base(fn)
+				}
+			}
+		}
+		if filename == "" {
+			if xfn := c.Get("X-Filename"); xfn != "" {
+				filename = filepath.Base(xfn)
+			}
+		}
+		if filename == "" {
+			if qfn := c.Query("filename"); qfn != "" {
+				filename = filepath.Base(qfn)
+			}
+		}
+		if filename == "" {
+			filename = "upload.bin"
+		}
+	}
+
+	fileDTO, err := h.service.Upload(c.Context(), filename, srcFile, explicitType)
+	if err != nil {
+		if errors.Is(err, service.ErrFileTooLarge) {
+			return ErrorResponse(c, err.Error(), http.StatusRequestEntityTooLarge)
+		}
+		return ErrorResponse(c, fmt.Sprintf("Failed to process file: %v", err), http.StatusInternalServerError)
+	}
+
+	return c.Status(http.StatusCreated).JSON(model.FileUploadResponse{
+		Status:  "success",
+		Message: "File uploaded and compressed successfully",
+		File:    *fileDTO,
+	})
+}
+
+func (h *StorageHandler) GetFile(c *fiber.Ctx) error {
+	idParam := c.Params("id")
+	fileID, err := uuid.Parse(idParam)
+	if err != nil {
+		return ErrorResponse(c, "Invalid file UUID", http.StatusBadRequest)
+	}
+
+	formatParam := strings.ToLower(c.Query("format"))
+	acceptHeader := strings.ToLower(c.Get("Accept"))
+	requestWebP := formatParam == "webp" || c.Query("webp") == "true" || c.Query("webp") == "1" ||
+		(formatParam == "" && strings.Contains(acceptHeader, "image/webp") && !strings.Contains(acceptHeader, "image/*") && !strings.Contains(acceptHeader, "*/*"))
+
+	var record *model.FileRecord
+	var stream io.Reader
+
+	if requestWebP {
+		rec, rdr, err := h.service.GetAsWebP(c.Context(), fileID)
+		switch {
+		case err == nil:
+			record = rec
+			stream = rdr
+		case errors.Is(err, repository.ErrRecordNotFound) || errors.Is(err, storage.ErrFileNotFound):
+			return ErrorResponse(c, "File not found", http.StatusNotFound)
+		case !errors.Is(err, service.ErrUnsupportedFormat):
+			return ErrorResponse(c, fmt.Sprintf("Failed to convert image: %v", err), http.StatusInternalServerError)
+		}
+	}
+
+	if record == nil {
+		rec, readCloser, err := h.service.Get(c.Context(), fileID)
+		if err != nil {
+			if errors.Is(err, repository.ErrRecordNotFound) || errors.Is(err, storage.ErrFileNotFound) {
+				return ErrorResponse(c, "File not found", http.StatusNotFound)
+			}
+			return ErrorResponse(c, fmt.Sprintf("Failed to retrieve file: %v", err), http.StatusInternalServerError)
+		}
+		record = rec
+		stream = readCloser
+		requestWebP = false
+	}
+
+	// Caching & ETag
+	etag := fmt.Sprintf(`"%s"`, record.SHA256)
+	if requestWebP {
+		etag = fmt.Sprintf(`"webp-%s"`, record.SHA256)
+	}
+
+	if match := c.Get("If-None-Match"); match != "" && (match == etag || match == "*") {
+		return c.SendStatus(http.StatusNotModified)
+	}
+
+	c.Set("Content-Type", record.ContentType)
+	c.Set("ETag", etag)
+	c.Set("Cache-Control", "public, max-age=31536000, immutable")
+	c.Set("X-Content-Type-Options", "nosniff")
+
+	isSafeImage := storage.IsImageMime(record.ContentType)
+	if !isSafeImage {
+		c.Set("Content-Security-Policy", "default-src 'none'; sandbox")
+	}
+
+	// Disposition: force attachment for non-image files or if explicit download requested
+	isDownload := c.Query("download") == "true" || c.Query("download") == "1" || !isSafeImage
+	dispositionType := "inline"
+	if isDownload {
+		dispositionType = "attachment"
+	}
+	c.Set("Content-Disposition", fmt.Sprintf(`%s; filename="%s"`, dispositionType, record.Filename))
+
+	// Image metadata headers
+	if record.Blurhash != nil && *record.Blurhash != "" {
+		c.Set("X-Blurhash", *record.Blurhash)
+	}
+	if record.Width != nil && *record.Width > 0 {
+		c.Set("X-Image-Width", strconv.Itoa(*record.Width))
+	}
+	if record.Height != nil && *record.Height > 0 {
+		c.Set("X-Image-Height", strconv.Itoa(*record.Height))
+	}
+
+	return c.SendStream(stream)
+}
+
+func (h *StorageHandler) GetFileInfo(c *fiber.Ctx) error {
+	idParam := c.Params("id")
+	fileID, err := uuid.Parse(idParam)
+	if err != nil {
+		return ErrorResponse(c, "Invalid file UUID", http.StatusBadRequest)
+	}
+
+	dto, err := h.service.GetInfo(c.Context(), fileID)
+	if err != nil {
+		if errors.Is(err, repository.ErrRecordNotFound) {
+			return ErrorResponse(c, "File not found", http.StatusNotFound)
+		}
+		return ErrorResponse(c, fmt.Sprintf("Failed to get file info: %v", err), http.StatusInternalServerError)
+	}
+
+	return c.Status(http.StatusOK).JSON(model.FileInfoResponse{
+		Status: "success",
+		File:   *dto,
+	})
+}
+
+func (h *StorageHandler) DeleteFile(c *fiber.Ctx) error {
+	idParam := c.Params("id")
+	fileID, err := uuid.Parse(idParam)
+	if err != nil {
+		return ErrorResponse(c, "Invalid file UUID", http.StatusBadRequest)
+	}
+
+	if err := h.service.Delete(c.Context(), fileID); err != nil {
+		if errors.Is(err, repository.ErrRecordNotFound) || errors.Is(err, storage.ErrFileNotFound) {
+			return ErrorResponse(c, "File not found", http.StatusNotFound)
+		}
+		return ErrorResponse(c, fmt.Sprintf("Failed to delete file: %v", err), http.StatusInternalServerError)
+	}
+
+	return c.Status(http.StatusOK).JSON(fiber.Map{
+		"message": "File deleted successfully",
+		"status":  "success",
+	})
+}
+
+type ImageMetadataRequest struct {
+	URL string `json:"url" query:"url"`
+}
+
+func (h *StorageHandler) GetImageMetadata(c *fiber.Ctx) error {
+	var req ImageMetadataRequest
+	if c.Method() == fiber.MethodPost && len(c.Body()) > 0 {
+		if err := c.BodyParser(&req); err != nil {
+			return ErrorResponse(c, "Invalid JSON payload. Expected {\"url\": \"https://...\"}", http.StatusBadRequest)
+		}
+	}
+	if req.URL == "" {
+		req.URL = c.Query("url")
+	}
+
+	trimmedURL := strings.TrimSpace(req.URL)
+	if trimmedURL == "" {
+		return ErrorResponse(c, "Image URL is required. Provide 'url' in JSON body or as a query parameter.", http.StatusBadRequest)
+	}
+
+	meta, err := h.service.GetImageMetadataFromURL(c.Context(), trimmedURL)
+	if err != nil {
+		if errors.Is(err, storage.ErrInvalidURL) || errors.Is(err, storage.ErrSSRFForbidden) {
+			return ErrorResponse(c, err.Error(), http.StatusBadRequest)
+		}
+		if errors.Is(err, storage.ErrImageTooLarge) {
+			return ErrorResponse(c, err.Error(), http.StatusRequestEntityTooLarge)
+		}
+		return ErrorResponse(c, fmt.Sprintf("Failed to process image: %v", err), http.StatusUnprocessableEntity)
+	}
+
+	return c.Status(http.StatusOK).JSON(fiber.Map{
+		"status":      "success",
+		"src":         meta.Src,
+		"width":       meta.Width,
+		"height":      meta.Height,
+		"aspectRatio": meta.AspectRatio,
+		"format":      meta.Format,
+		"size":        meta.Size,
+		"blurhash":    meta.Blurhash,
+		"blurDataURL": meta.BlurDataURL,
+		"blurWidth":   meta.BlurWidth,
+		"blurHeight":  meta.BlurHeight,
+		"data":        meta,
+	})
+}

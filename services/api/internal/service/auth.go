@@ -1,0 +1,762 @@
+package service
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"image/png"
+	"net/mail"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/pquerna/otp/totp"
+	"golang.org/x/crypto/bcrypt"
+	"github.com/irvanmalik48/realm-api/internal/auth"
+	"github.com/irvanmalik48/realm-api/internal/model"
+	"github.com/irvanmalik48/realm-api/internal/repository"
+)
+
+var (
+	ErrInvalidCredentials = errors.New("invalid email/username or password")
+	ErrInvalidEmail       = errors.New("invalid email address format")
+	ErrInvalidUsername    = errors.New("username must be 3-30 characters (alphanumeric and underscores only)")
+	ErrPasswordTooShort   = errors.New("password must be at least 8 characters long")
+	ErrPasswordTooLong    = errors.New("password must not exceed 72 characters")
+	ErrFullNameRequired   = errors.New("full name must be between 2 and 100 characters")
+	ErrUsernameTaken      = errors.New("username is already taken")
+	ErrCurrentPasswordReq = errors.New("current password is required to change password")
+	ErrCurrentPasswordBad = errors.New("incorrect current password")
+	ErrDatabaseUnavailable = errors.New("database repository unavailable")
+	ErrUnverifiedOAuthEmail = errors.New("unverified email from OAuth provider cannot be used for authentication")
+	ErrAccountDeactivated   = errors.New("user account has been deactivated")
+)
+
+// Precomputed valid bcrypt hash used to prevent timing attacks when a user is not found
+var dummyBcryptHash = []byte("$2a$10$wN9P321dKqM3gR13c8p2OeR5K3UqK9uRkR7c5c2Hqf7oW3h7aF3Ce")
+
+var (
+	boolTrue  = true
+	boolFalse = false
+)
+
+var usernameRegex = regexp.MustCompile(`^[a-zA-Z0-9_]{3,30}$`)
+
+type AuthService interface {
+	Register(ctx context.Context, input model.RegisterInput) (*model.AuthResponse, error)
+	Login(ctx context.Context, input model.LoginInput) (*model.AuthResponse, error)
+	HandleOAuthLogin(ctx context.Context, userInfo *OAuthUserInfo) (*model.AuthResponse, error)
+	GetProfile(ctx context.Context, userID uuid.UUID) (*model.UserDTO, error)
+	UpdateProfile(ctx context.Context, userID uuid.UUID, input model.UpdateProfileInput) (*model.UserDTO, error)
+	SetPassword(ctx context.Context, userID uuid.UUID, input model.SetPasswordInput) error
+	LinkOAuthAccount(ctx context.Context, userID uuid.UUID, userInfo *OAuthUserInfo) error
+	UnlinkOAuthAccount(ctx context.Context, userID uuid.UUID, provider string) error
+	CheckAvailability(ctx context.Context, username, email string) (*model.CheckAvailabilityResponse, error)
+	Setup2FA(ctx context.Context, userID uuid.UUID) (*model.Setup2FAResponse, error)
+	Enable2FA(ctx context.Context, userID uuid.UUID, code, secret string) (*model.Enable2FAResponse, error)
+	Disable2FA(ctx context.Context, userID uuid.UUID, code, password string) error
+	Verify2FA(ctx context.Context, tempToken, code string) (*model.AuthResponse, error)
+}
+
+type authService struct {
+	userRepo  repository.UserRepository
+	pasetoSvc auth.PasetoService
+	tokenTTL  time.Duration
+}
+
+func NewAuthService(userRepo repository.UserRepository, pasetoSvc auth.PasetoService) AuthService {
+	return &authService{
+		userRepo:  userRepo,
+		pasetoSvc: pasetoSvc,
+		tokenTTL:  7 * 24 * time.Hour,
+	}
+}
+
+func (s *authService) getConnectedAccounts(ctx context.Context, userID uuid.UUID) []model.OAuthAccount {
+	if s.userRepo == nil {
+		return nil
+	}
+	accts, err := s.userRepo.GetOAuthAccounts(ctx, userID)
+	if err != nil {
+		return nil
+	}
+	return accts
+}
+
+func (s *authService) Register(ctx context.Context, input model.RegisterInput) (*model.AuthResponse, error) {
+	if s.userRepo == nil {
+		return nil, ErrDatabaseUnavailable
+	}
+
+	email := strings.TrimSpace(input.Email)
+	username := strings.TrimSpace(input.Username)
+	fullName := strings.TrimSpace(input.FullName)
+
+	// 1. Validation
+	if _, err := mail.ParseAddress(email); err != nil || !strings.Contains(email, "@") {
+		return nil, ErrInvalidEmail
+	}
+	if !usernameRegex.MatchString(username) {
+		return nil, ErrInvalidUsername
+	}
+	if len(input.Password) < 8 {
+		return nil, ErrPasswordTooShort
+	}
+	if len(input.Password) > 72 {
+		return nil, ErrPasswordTooLong
+	}
+	if len(fullName) < 2 || len(fullName) > 100 {
+		return nil, ErrFullNameRequired
+	}
+
+	// 2. Hash Password
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(input.Password), bcrypt.DefaultCost)
+	if err != nil {
+		return nil, fmt.Errorf("failed to hash password: %w", err)
+	}
+	hashStr := string(hashedPassword)
+
+	// 3. Create User in Repository
+	now := time.Now().UTC()
+	user := &model.User{
+		ID:           uuid.New(),
+		Email:        strings.ToLower(email),
+		Username:     strings.ToLower(username),
+		FullName:     fullName,
+		PasswordHash: &hashStr,
+		AvatarURL:    input.AvatarURL,
+		Provider:     "local",
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+
+	if err := s.userRepo.Create(ctx, user); err != nil {
+		return nil, err
+	}
+
+	// 4. Generate PASETO Bearer Token
+	token, err := s.pasetoSvc.GenerateToken(user, s.tokenTTL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate token: %w", err)
+	}
+
+	return &model.AuthResponse{
+		Status:  "success",
+		Message: "Registration successful",
+		Token:   token,
+		User:    user.ToDTO(),
+	}, nil
+}
+
+func (s *authService) Login(ctx context.Context, input model.LoginInput) (*model.AuthResponse, error) {
+	if s.userRepo == nil {
+		return nil, ErrDatabaseUnavailable
+	}
+
+	identifier := strings.TrimSpace(input.Identifier)
+	if identifier == "" || input.Password == "" {
+		return nil, ErrInvalidCredentials
+	}
+
+	user, err := s.userRepo.GetByIdentifier(ctx, identifier)
+	if err != nil {
+		if errors.Is(err, repository.ErrUserNotFound) {
+			_ = bcrypt.CompareHashAndPassword(dummyBcryptHash, []byte(input.Password))
+			return nil, ErrInvalidCredentials
+		}
+		return nil, err
+	}
+
+	if !user.IsActive {
+		return nil, ErrAccountDeactivated
+	}
+
+	if user.PasswordHash == nil || *user.PasswordHash == "" {
+		_ = bcrypt.CompareHashAndPassword(dummyBcryptHash, []byte(input.Password))
+		return nil, ErrInvalidCredentials
+	}
+
+	if err := bcrypt.CompareHashAndPassword([]byte(*user.PasswordHash), []byte(input.Password)); err != nil {
+		return nil, ErrInvalidCredentials
+	}
+
+	accounts := s.getConnectedAccounts(ctx, user.ID)
+
+	if user.TwoFactorEnabled {
+		tempToken, err := s.pasetoSvc.Generate2FATempToken(user, 5*time.Minute)
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate 2fa challenge token: %w", err)
+		}
+
+		return &model.AuthResponse{
+			Status:            "2fa_required",
+			Message:           "Two-factor authentication verification required",
+			TwoFactorRequired: true,
+			TempToken:         tempToken,
+			User:              user.ToDTOWithAccounts(accounts),
+		}, nil
+	}
+
+	token, err := s.pasetoSvc.GenerateToken(user, s.tokenTTL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate token: %w", err)
+	}
+
+	return &model.AuthResponse{
+		Status:  "success",
+		Message: "Login successful",
+		Token:   token,
+		User:    user.ToDTOWithAccounts(accounts),
+	}, nil
+}
+
+func (s *authService) HandleOAuthLogin(ctx context.Context, userInfo *OAuthUserInfo) (*model.AuthResponse, error) {
+	if s.userRepo == nil {
+		return nil, errors.New("database user repository unavailable")
+	}
+
+	if !userInfo.EmailVerified {
+		return nil, ErrUnverifiedOAuthEmail
+	}
+
+	var avatarPtr *string
+	if userInfo.AvatarURL != "" {
+		avatarPtr = &userInfo.AvatarURL
+	}
+
+	// 1. Try finding by OAuth account
+	user, err := s.userRepo.GetByOAuthAccount(ctx, userInfo.Provider, userInfo.ProviderID)
+	if err == nil && user != nil {
+		if !user.IsActive {
+			return nil, ErrAccountDeactivated
+		}
+		// Update avatar if provided
+		if userInfo.AvatarURL != "" && (user.AvatarURL == nil || *user.AvatarURL == "") {
+			user.AvatarURL = &userInfo.AvatarURL
+			user.UpdatedAt = time.Now().UTC()
+			_ = s.userRepo.Update(ctx, user)
+		}
+
+		// Also link/update avatar in oauth accounts table
+		_ = s.userRepo.LinkOAuthAccount(ctx, &model.OAuthAccount{
+			UserID:     user.ID,
+			Provider:   userInfo.Provider,
+			ProviderID: userInfo.ProviderID,
+			Email:      &userInfo.Email,
+			AvatarURL:  avatarPtr,
+			CreatedAt:  time.Now().UTC(),
+		})
+
+		token, err := s.pasetoSvc.GenerateToken(user, s.tokenTTL)
+		if err != nil {
+			return nil, err
+		}
+		accounts := s.getConnectedAccounts(ctx, user.ID)
+		return &model.AuthResponse{
+			Status:  "success",
+			Message: "OAuth login successful",
+			Token:   token,
+			User:    user.ToDTOWithAccounts(accounts),
+		}, nil
+	}
+
+	// 2. Try finding by email to link account
+	user, err = s.userRepo.GetByEmail(ctx, userInfo.Email)
+	if err == nil && user != nil {
+		if !user.IsActive {
+			return nil, ErrAccountDeactivated
+		}
+		oauthAcct := &model.OAuthAccount{
+			ID:         uuid.New(),
+			UserID:     user.ID,
+			Provider:   userInfo.Provider,
+			ProviderID: userInfo.ProviderID,
+			Email:      &userInfo.Email,
+			AvatarURL:  avatarPtr,
+			CreatedAt:  time.Now().UTC(),
+		}
+		_ = s.userRepo.LinkOAuthAccount(ctx, oauthAcct)
+
+		if user.AvatarURL == nil || *user.AvatarURL == "" {
+			user.AvatarURL = &userInfo.AvatarURL
+			user.UpdatedAt = time.Now().UTC()
+			_ = s.userRepo.Update(ctx, user)
+		}
+
+		token, err := s.pasetoSvc.GenerateToken(user, s.tokenTTL)
+		if err != nil {
+			return nil, err
+		}
+		accounts := s.getConnectedAccounts(ctx, user.ID)
+		return &model.AuthResponse{
+			Status:  "success",
+			Message: "OAuth login successful",
+			Token:   token,
+			User:    user.ToDTOWithAccounts(accounts),
+		}, nil
+	}
+
+	// 3. Register new user from OAuth info
+	now := time.Now().UTC()
+	cleanUsername := strings.ToLower(strings.TrimSpace(userInfo.Username))
+	if !usernameRegex.MatchString(cleanUsername) {
+		cleanUsername = "user_" + uuid.New().String()[:8]
+	}
+
+	// Ensure username uniqueness
+	originalUsername := cleanUsername
+	counter := 1
+	for {
+		_, err := s.userRepo.GetByUsername(ctx, cleanUsername)
+		if errors.Is(err, repository.ErrUserNotFound) {
+			break
+		}
+		cleanUsername = fmt.Sprintf("%s_%d", originalUsername[:min(len(originalUsername), 20)], counter)
+		counter++
+		if counter > 50 {
+			cleanUsername = "user_" + uuid.New().String()[:8]
+			break
+		}
+	}
+
+	fullName := strings.TrimSpace(userInfo.FullName)
+	if fullName == "" {
+		fullName = cleanUsername
+	}
+
+	newUser := &model.User{
+		ID:           uuid.New(),
+		Email:        strings.ToLower(strings.TrimSpace(userInfo.Email)),
+		Username:     cleanUsername,
+		FullName:     fullName,
+		PasswordHash: nil,
+		AvatarURL:    avatarPtr,
+		Provider:     userInfo.Provider,
+		ProviderID:   &userInfo.ProviderID,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+
+	if err := s.userRepo.Create(ctx, newUser); err != nil {
+		return nil, fmt.Errorf("failed to create oauth user: %w", err)
+	}
+
+	// Also link in oauth accounts table
+	oauthAcct := &model.OAuthAccount{
+		ID:         uuid.New(),
+		UserID:     newUser.ID,
+		Provider:   userInfo.Provider,
+		ProviderID: userInfo.ProviderID,
+		Email:      &userInfo.Email,
+		AvatarURL:  avatarPtr,
+		CreatedAt:  now,
+	}
+	_ = s.userRepo.LinkOAuthAccount(ctx, oauthAcct)
+
+	token, err := s.pasetoSvc.GenerateToken(newUser, s.tokenTTL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate token: %w", err)
+	}
+
+	accounts := s.getConnectedAccounts(ctx, newUser.ID)
+
+	return &model.AuthResponse{
+		Status:  "success",
+		Message: "OAuth registration successful",
+		Token:   token,
+		User:    newUser.ToDTOWithAccounts(accounts),
+	}, nil
+}
+
+func (s *authService) GetProfile(ctx context.Context, userID uuid.UUID) (*model.UserDTO, error) {
+	if s.userRepo == nil {
+		return nil, ErrDatabaseUnavailable
+	}
+	user, err := s.userRepo.GetByID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	accounts := s.getConnectedAccounts(ctx, userID)
+	return user.ToDTOWithAccounts(accounts), nil
+}
+
+func (s *authService) UpdateProfile(ctx context.Context, userID uuid.UUID, input model.UpdateProfileInput) (*model.UserDTO, error) {
+	if s.userRepo == nil {
+		return nil, ErrDatabaseUnavailable
+	}
+
+	user, err := s.userRepo.GetByID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	if input.FullName != nil && strings.TrimSpace(*input.FullName) != "" {
+		trimmed := strings.TrimSpace(*input.FullName)
+		if len(trimmed) < 2 || len(trimmed) > 100 {
+			return nil, ErrFullNameRequired
+		}
+		user.FullName = trimmed
+	}
+
+	if input.Username != nil && strings.TrimSpace(*input.Username) != "" {
+		cleanUsername := strings.ToLower(strings.TrimSpace(*input.Username))
+		if cleanUsername != user.Username {
+			if !usernameRegex.MatchString(cleanUsername) {
+				return nil, ErrInvalidUsername
+			}
+			existing, err := s.userRepo.GetByUsername(ctx, cleanUsername)
+			if err == nil && existing != nil && existing.ID != user.ID {
+				return nil, ErrUsernameTaken
+			}
+			user.Username = cleanUsername
+		}
+	}
+
+	if input.AvatarURL != nil {
+		if strings.TrimSpace(*input.AvatarURL) == "" {
+			user.AvatarURL = nil
+		} else {
+			trimmedURL := strings.TrimSpace(*input.AvatarURL)
+			user.AvatarURL = &trimmedURL
+		}
+	}
+
+	user.UpdatedAt = time.Now().UTC()
+	if err := s.userRepo.Update(ctx, user); err != nil {
+		return nil, err
+	}
+
+	accounts := s.getConnectedAccounts(ctx, userID)
+	return user.ToDTOWithAccounts(accounts), nil
+}
+
+func (s *authService) SetPassword(ctx context.Context, userID uuid.UUID, input model.SetPasswordInput) error {
+	if s.userRepo == nil {
+		return ErrDatabaseUnavailable
+	}
+
+	if len(input.NewPassword) < 8 {
+		return ErrPasswordTooShort
+	}
+	if len(input.NewPassword) > 72 {
+		return ErrPasswordTooLong
+	}
+
+	user, err := s.userRepo.GetByID(ctx, userID)
+	if err != nil {
+		return err
+	}
+
+	// If user already has a password, verify current password
+	if user.PasswordHash != nil && *user.PasswordHash != "" {
+		if input.CurrentPassword == nil || *input.CurrentPassword == "" {
+			return ErrCurrentPasswordReq
+		}
+		if err := bcrypt.CompareHashAndPassword([]byte(*user.PasswordHash), []byte(*input.CurrentPassword)); err != nil {
+			return ErrCurrentPasswordBad
+		}
+	}
+
+	// Hash new password
+	newHash, err := bcrypt.GenerateFromPassword([]byte(input.NewPassword), bcrypt.DefaultCost)
+	if err != nil {
+		return fmt.Errorf("failed to hash password: %w", err)
+	}
+
+	return s.userRepo.UpdatePassword(ctx, userID, string(newHash))
+}
+
+func (s *authService) LinkOAuthAccount(ctx context.Context, userID uuid.UUID, userInfo *OAuthUserInfo) error {
+	if s.userRepo == nil {
+		return ErrDatabaseUnavailable
+	}
+
+	var avatarPtr *string
+	if userInfo.AvatarURL != "" {
+		avatarPtr = &userInfo.AvatarURL
+	}
+
+	oauthAcct := &model.OAuthAccount{
+		ID:         uuid.New(),
+		UserID:     userID,
+		Provider:   userInfo.Provider,
+		ProviderID: userInfo.ProviderID,
+		Email:      &userInfo.Email,
+		AvatarURL:  avatarPtr,
+		CreatedAt:  time.Now().UTC(),
+	}
+
+	return s.userRepo.LinkOAuthAccount(ctx, oauthAcct)
+}
+
+func (s *authService) UnlinkOAuthAccount(ctx context.Context, userID uuid.UUID, provider string) error {
+	if s.userRepo == nil {
+		return ErrDatabaseUnavailable
+	}
+
+	return s.userRepo.UnlinkOAuthAccount(ctx, userID, provider)
+}
+
+func (s *authService) CheckAvailability(ctx context.Context, username, email string) (*model.CheckAvailabilityResponse, error) {
+	resp := &model.CheckAvailabilityResponse{}
+
+	if s.userRepo == nil {
+		if username != "" {
+			trimmedUsername := strings.TrimSpace(username)
+			if !usernameRegex.MatchString(trimmedUsername) {
+				resp.UsernameAvailable = &boolFalse
+				resp.UsernameReason = "Username must be 3-30 characters (alphanumeric and underscores only)"
+			} else {
+				resp.UsernameAvailable = &boolTrue
+			}
+		}
+		if email != "" {
+			trimmedEmail := strings.TrimSpace(email)
+			if _, err := mail.ParseAddress(trimmedEmail); err != nil || !strings.Contains(trimmedEmail, "@") {
+				resp.EmailAvailable = &boolFalse
+				resp.EmailReason = "Invalid email format"
+			} else {
+				resp.EmailAvailable = &boolTrue
+			}
+		}
+		return resp, nil
+	}
+
+	if username != "" {
+		trimmedUsername := strings.TrimSpace(username)
+		if !usernameRegex.MatchString(trimmedUsername) {
+			resp.UsernameAvailable = &boolFalse
+			resp.UsernameReason = "Username must be 3-30 characters (alphanumeric and underscores only)"
+		} else {
+			_, err := s.userRepo.GetByUsername(ctx, trimmedUsername)
+			switch {
+			case errors.Is(err, repository.ErrUserNotFound):
+				resp.UsernameAvailable = &boolTrue
+			case err == nil:
+				resp.UsernameAvailable = &boolFalse
+				resp.UsernameReason = "Username is already taken"
+			default:
+				return nil, err
+			}
+		}
+	}
+
+	if email != "" {
+		trimmedEmail := strings.TrimSpace(email)
+		if _, err := mail.ParseAddress(trimmedEmail); err != nil || !strings.Contains(trimmedEmail, "@") {
+			resp.EmailAvailable = &boolFalse
+			resp.EmailReason = "Invalid email format"
+		} else {
+			_, err := s.userRepo.GetByEmail(ctx, trimmedEmail)
+			switch {
+			case errors.Is(err, repository.ErrUserNotFound):
+				resp.EmailAvailable = &boolTrue
+			case err == nil:
+				resp.EmailAvailable = &boolFalse
+				resp.EmailReason = "Email is already registered"
+			default:
+				return nil, err
+			}
+		}
+	}
+
+	return resp, nil
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+const recoveryCharset = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+
+func generateRecoveryCodes(count int) []string {
+	codes := make([]string, count)
+	for i := 0; i < count; i++ {
+		bytes := make([]byte, 8)
+		_, _ = rand.Read(bytes)
+		var sb strings.Builder
+		for j, b := range bytes {
+			if j == 4 {
+				sb.WriteRune('-')
+			}
+			sb.WriteByte(recoveryCharset[int(b)%len(recoveryCharset)])
+		}
+		codes[i] = sb.String()
+	}
+	return codes
+}
+
+func (s *authService) Setup2FA(ctx context.Context, userID uuid.UUID) (*model.Setup2FAResponse, error) {
+	if s.userRepo == nil {
+		return nil, ErrDatabaseUnavailable
+	}
+
+	user, err := s.userRepo.GetByID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	key, err := totp.Generate(totp.GenerateOpts{
+		Issuer:      "Realm HQ",
+		AccountName: user.Email,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate totp key: %w", err)
+	}
+
+	if err := s.userRepo.Update2FASecret(ctx, userID, key.Secret()); err != nil {
+		return nil, fmt.Errorf("failed to save 2fa secret: %w", err)
+	}
+
+	var buf bytes.Buffer
+	img, err := key.Image(240, 240)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate qr code image: %w", err)
+	}
+	if err := png.Encode(&buf, img); err != nil {
+		return nil, fmt.Errorf("failed to encode qr code png: %w", err)
+	}
+
+	qrBase64 := "data:image/png;base64," + base64.StdEncoding.EncodeToString(buf.Bytes())
+
+	return &model.Setup2FAResponse{
+		Secret:     key.Secret(),
+		QRCode:     qrBase64,
+		OtpauthURL: key.URL(),
+	}, nil
+}
+
+func (s *authService) Enable2FA(ctx context.Context, userID uuid.UUID, code, secret string) (*model.Enable2FAResponse, error) {
+	if s.userRepo == nil {
+		return nil, ErrDatabaseUnavailable
+	}
+
+	user, err := s.userRepo.GetByID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	totpSecret := secret
+	if totpSecret == "" && user.TwoFactorSecret != nil {
+		totpSecret = *user.TwoFactorSecret
+	}
+	if totpSecret == "" {
+		return nil, errors.New("no 2fa secret found; please initiate setup first")
+	}
+
+	trimmedCode := strings.TrimSpace(code)
+	if !totp.Validate(trimmedCode, totpSecret) {
+		return nil, errors.New("invalid verification code; please check your authenticator app and try again")
+	}
+
+	recoveryCodes := generateRecoveryCodes(8)
+	if err := s.userRepo.Enable2FA(ctx, userID, totpSecret, recoveryCodes); err != nil {
+		return nil, fmt.Errorf("failed to enable 2fa: %w", err)
+	}
+
+	return &model.Enable2FAResponse{
+		Status:        "success",
+		Message:       "Two-factor authentication has been enabled successfully",
+		RecoveryCodes: recoveryCodes,
+	}, nil
+}
+
+func (s *authService) Disable2FA(ctx context.Context, userID uuid.UUID, code, password string) error {
+	if s.userRepo == nil {
+		return ErrDatabaseUnavailable
+	}
+
+	user, err := s.userRepo.GetByID(ctx, userID)
+	if err != nil {
+		return err
+	}
+
+	if !user.TwoFactorEnabled {
+		return errors.New("two-factor authentication is not currently enabled")
+	}
+
+	valid := false
+	if code != "" && user.TwoFactorSecret != nil {
+		if totp.Validate(strings.TrimSpace(code), *user.TwoFactorSecret) {
+			valid = true
+		}
+	}
+
+	if !valid && password != "" && user.PasswordHash != nil {
+		if err := bcrypt.CompareHashAndPassword([]byte(*user.PasswordHash), []byte(password)); err == nil {
+			valid = true
+		}
+	}
+
+	if !valid {
+		return errors.New("invalid confirmation code or password")
+	}
+
+	return s.userRepo.Disable2FA(ctx, userID)
+}
+
+func (s *authService) Verify2FA(ctx context.Context, tempToken, code string) (*model.AuthResponse, error) {
+	if s.userRepo == nil {
+		return nil, ErrDatabaseUnavailable
+	}
+
+	claims, err := s.pasetoSvc.VerifyToken(tempToken)
+	if err != nil {
+		return nil, errors.New("session expired or invalid; please log in again")
+	}
+
+	if claims.Purpose != "2fa_challenge" {
+		return nil, errors.New("invalid token purpose")
+	}
+
+	userID, err := uuid.Parse(claims.ID)
+	if err != nil {
+		return nil, errors.New("invalid user id")
+	}
+
+	user, err := s.userRepo.GetByID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	if !user.TwoFactorEnabled || user.TwoFactorSecret == nil {
+		return nil, errors.New("two-factor authentication is not active for this account")
+	}
+
+	trimmedCode := strings.TrimSpace(code)
+	valid := len(trimmedCode) == 6 && totp.Validate(trimmedCode, *user.TwoFactorSecret)
+
+	// 2. Try recovery code validation
+	if !valid {
+		consumed, err := s.userRepo.ConsumeRecoveryCode(ctx, userID, trimmedCode)
+		if err == nil && consumed {
+			valid = true
+		}
+	}
+
+	if !valid {
+		return nil, errors.New("invalid verification code or recovery code")
+	}
+
+	token, err := s.pasetoSvc.GenerateToken(user, s.tokenTTL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate token: %w", err)
+	}
+
+	accounts := s.getConnectedAccounts(ctx, user.ID)
+
+	return &model.AuthResponse{
+		Status:  "success",
+		Message: "Authentication successful",
+		Token:   token,
+		User:    user.ToDTOWithAccounts(accounts),
+	}, nil
+}
+
