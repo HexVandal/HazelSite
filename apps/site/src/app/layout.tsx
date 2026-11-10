@@ -9,6 +9,7 @@ import "../app/globals.css";
 import TargetCursor from "@/components/TargetCursor";
 import { SmoothScroll } from "@/components/smooth-scroll";
 import { Analytics } from "@vercel/analytics/next";
+import { VisitTracker } from "@/components/visit-tracker";
 
 // import OgImage from "./opengraph-image.png";
 
@@ -80,6 +81,7 @@ export default function RootLayout({
             <Providers>
               <SmoothScroll />
               <Analytics />
+              <VisitTracker />
               <TargetCursor
                 targetSelector="a, button, [role='button'], input, textarea, select, [tabindex]:not([tabindex='-1'])"
                 cursorColor="#e8e2ef"
