@@ -96,17 +96,12 @@ function referrerLabel(referrer: string): string {
 }
 
 async function listDayPathnames(token: string): Promise<string[]> {
+  // One page of 1000 day files covers ~2.7 years of analytics — plenty here,
+  // and it keeps the blob typing simple (no pagination cursor juggling).
+  const result = await list({ prefix: ANALYTICS_PREFIX, token, limit: 1000 });
   const pathnames: string[] = [];
-  let cursor: string | null = null;
-  for (let page = 0; page < 5; page += 1) {
-    const result = await list({ prefix: ANALYTICS_PREFIX, token, limit: 1000, cursor });
-    pathnames.push(
-      ...result.blobs
-        .map((blob) => blob.pathname)
-        .filter((pathname) => pathname.endsWith(".json")),
-    );
-    if (!result.hasMore || !result.cursor) break;
-    cursor = result.cursor;
+  for (const blob of result.blobs) {
+    if (blob.pathname.endsWith(".json")) pathnames.push(blob.pathname);
   }
   return pathnames;
 }
