@@ -2,8 +2,6 @@ import { get, list } from "@vercel/blob";
 import { NextRequest, NextResponse } from "next/server";
 import { requireAuth } from "@/lib/auth/server-auth";
 
-export const runtime = "nodejs";
-
 type StoredVisit = {
   id: string;
   timestamp: string;
