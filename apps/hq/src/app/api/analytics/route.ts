@@ -3,7 +3,6 @@ import { NextRequest, NextResponse } from "next/server";
 import { requireAuth } from "@/lib/auth/server-auth";
 
 export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
 
 type StoredVisit = {
   id: string;
